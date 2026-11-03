@@ -2556,6 +2556,7 @@ def collector_main():
         # Consume old Telegram updates so commands from previous days are not replayed.
         old, offset = telegram_get_updates(None)
         print(f"Telegram ready; ignored {len(old)} old update(s).")
+        telegram_send_message("✅ Collector آماده است؛ حالا /status یا /report را بفرست.")
 
         now = tehran_now()
         if hhmmss(now) < MARKET_START_HHMMSS:
