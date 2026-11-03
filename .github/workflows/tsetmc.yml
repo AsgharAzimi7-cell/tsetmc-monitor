@@ -23,6 +23,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Test first Iran proxy
+        continue-on-error: true
         env:
           TSETMC_PROXY: ${{ secrets.TSETMC_PROXY }}
         run: |
