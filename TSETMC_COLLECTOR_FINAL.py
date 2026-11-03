@@ -115,7 +115,7 @@ DAILY_CONTEXT_DAYS = 260
 # Intraday aggregation.
 INTRADAY_BUCKET_MINUTES = 5
 MARKET_START_HHMMSS = 0
-MARKET_END_HHMMSS = 235959
+MARKET_END_HHMMSS = 153500
 
 # Slow-changing/current extras are cached to make repeated intraday runs fast.
 HOLDERS_CACHE_MINUTES = 45
