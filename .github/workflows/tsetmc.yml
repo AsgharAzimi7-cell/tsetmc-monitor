@@ -24,5 +24,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TSETMC_PROXY: ${{ secrets.TSETMC_PROXY }}
         run: |
           python TSETMC_LIVE_WITH_INDICES_INTRADAY_FIXED.py
