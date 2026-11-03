@@ -30,7 +30,13 @@ jobs:
           echo 'Testing Iran proxy...'
           curl --fail --silent --show-error -m 20 -x "$TSETMC_PROXY" https://api.ipify.org || true
           echo ''
-
+             - name: Restore TSETMC database cache
+          uses: actions/cache@v4
+          with:
+          path: TSETMC_LOCAL_HISTORY.db
+          key: tsetmc-db-${{ github.run_id }}
+          restore-keys: |
+            tsetmc-db-
       - name: Run TSETMC collector
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
