@@ -1,11 +1,15 @@
-name: TSETMC Collector
+name: TSETMC Automatic Collector
 
 on:
   workflow_dispatch:
+  schedule:
+    # 08:55 Iran time (UTC+3:30), Saturday through Wednesday
+    - cron: '25 5 * * 6,0-3'
 
 jobs:
-  run:
+  collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 270
 
     steps:
       - name: Checkout repository
@@ -14,30 +18,36 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Test Iran proxy
+      - name: Test first Iran proxy
         env:
           TSETMC_PROXY: ${{ secrets.TSETMC_PROXY }}
         run: |
-          echo "=== Testing proxy IP ==="
-          curl -m 20 -x "$TSETMC_PROXY" https://api.ipify.org
-          echo ""
-          echo "=== Testing TSETMC through proxy ==="
-          curl -m 20 -I -x "$TSETMC_PROXY" \
-            -A "Mozilla/5.0" \
-            https://cdn.tsetmc.com
+          echo 'Testing Iran proxy...'
+          curl --fail --silent --show-error -m 20 -x "$TSETMC_PROXY" https://api.ipify.org || true
+          echo ''
 
-      - name: Run TSETMC script
+      - name: Run TSETMC collector
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TSETMC_PROXY: ${{ secrets.TSETMC_PROXY }}
-          HTTP_PROXY: ${{ secrets.TSETMC_PROXY }}
-          HTTPS_PROXY: ${{ secrets.TSETMC_PROXY }}
-        run: |
-          python TSETMC_LIVE_WITH_INDICES_INTRADAY_FIXED.py
+          TSETMC_PROXIES: ${{ secrets.TSETMC_PROXIES }}
+          COLLECTOR_MODE: '1'
+          SNAPSHOT_SECONDS: '30'
+        run: python TSETMC_COLLECTOR_FINAL.py
+
+      - name: Upload reports and local DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsetmc-${{ github.run_id }}
+          path: |
+            TSETMC_*.xlsx
+            TSETMC_LOCAL_HISTORY.db
+          if-no-files-found: ignore
+          retention-days: 30
