@@ -49,7 +49,8 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-import requests import os
+import requests 
+import os
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
