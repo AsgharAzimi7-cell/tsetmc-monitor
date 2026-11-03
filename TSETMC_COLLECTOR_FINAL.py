@@ -45,6 +45,7 @@ import os
 import random
 import sqlite3
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +65,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
+HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 # ============================================================
 # SETTINGS
@@ -112,8 +114,8 @@ DAILY_CONTEXT_DAYS = 260
 
 # Intraday aggregation.
 INTRADAY_BUCKET_MINUTES = 5
-MARKET_START_HHMMSS = 0
-MARKET_END_HHMMSS = 235959
+MARKET_START_HHMMSS = 90000
+MARKET_END_HHMMSS = 123000
 
 # Slow-changing/current extras are cached to make repeated intraday runs fast.
 HOLDERS_CACHE_MINUTES = 45
@@ -2471,6 +2473,97 @@ def build_status_text(live_data):
     return "\n".join(lines)
 
 
+def collect_fast_symbol(conn, symbol):
+    """Lightweight snapshot: price + client type + best limits only."""
+    inscode = meta_get(conn, f"inscode:{symbol}")
+    if not inscode:
+        inscode = find_symbol_online(symbol)
+        meta_set(conn, f"inscode:{symbol}", inscode)
+
+    p = api_get(
+        f"ClosingPrice/GetClosingPriceInfo/{inscode}",
+        symbol,
+        "FAST_ClosingPriceInfo",
+        allow_fail=False,
+    )
+    current = unwrap_dict(p, ("closingPriceInfo",))
+
+    market_date = to_int(
+        current.get("dEven"),
+        to_int(tehran_now().strftime("%Y%m%d"), 0),
+    )
+    current_volume = to_float(current.get("qTotTran5J"), 0)
+    current_close = to_float(current.get("pClosing"), 0)
+    final_last_date = to_int(current.get("finalLastDate"), 0)
+    is_final = market_date > 0 and final_last_date == market_date
+
+    if current_volume > 0 and current_close > 0:
+        upsert_daily(conn, symbol, inscode, current, finalized=is_final)
+
+    client = {}
+    if FETCH_CLIENT_TYPE:
+        p = api_get(
+            f"ClientType/GetClientType/{inscode}/1/0",
+            symbol,
+            "FAST_ClientTypeCurrent",
+        )
+        client = unwrap_dict(p, ("clientType",))
+
+    best = []
+    if FETCH_BEST_LIMITS:
+        p = api_get(
+            f"BestLimits/{inscode}",
+            symbol,
+            "FAST_BestLimitsCurrent",
+        )
+        best = unwrap_list(p, ("bestLimits",))
+        for r in best:
+            if isinstance(r, dict):
+                r["Symbol"] = symbol
+
+    return {
+        "symbol": symbol,
+        "inscode": inscode,
+        "current": current,
+        "client": client,
+        "best": best,
+        "holders": [],
+        "codal": [],
+        "messages": [],
+        "pv": [],
+        "pv_quality": {"Symbol": symbol, "Date": market_date, "Status": "FAST_ONLY"},
+    }
+
+
+def run_fast_snapshot(conn):
+    """Collect only the fast-changing fields. Designed for ~30-second cadence."""
+    global API_STATUS
+    API_STATUS = []
+    started = time.time()
+    captured_at = tehran_now().strftime("%H:%M:%S")
+    live_data = []
+
+    for symbol in SYMBOLS:
+        try:
+            live = collect_fast_symbol(conn, symbol)
+            live_data.append(live)
+            save_client_intraday(conn, live, captured_at=captured_at)
+        except Exception as e:
+            print(f"FAST {symbol} failed: {e}")
+            API_STATUS.append({
+                "Symbol": symbol,
+                "Endpoint": "FAST_SYMBOL_TOTAL",
+                "Status": "FAILED",
+                "HTTP": "",
+                "Attempts": "",
+                "Seconds": "",
+                "Error": str(e),
+            })
+
+    print(f"Fast snapshot complete in {time.time()-started:.1f}s ({len(live_data)}/{len(SYMBOLS)} symbols)")
+    return live_data
+
+
 def run_once(conn, output_path=None):
     global API_STATUS
     API_STATUS = []
@@ -2519,7 +2612,7 @@ def run_once(conn, output_path=None):
     return Path(output_path), live_data
 
 
-def handle_telegram_commands(conn, live_data, offset):
+def handle_telegram_commands(conn, live_data, offset, report_state=None):
     updates, offset = telegram_get_updates(offset)
     for upd in updates:
         msg = upd.get("message") or upd.get("edited_message") or {}
@@ -2528,35 +2621,67 @@ def handle_telegram_commands(conn, live_data, offset):
             continue
         text = (msg.get("text") or "").strip().lower()
         if text.startswith("/report"):
-            report_path = APP_DIR / f"TSETMC_INTRADAY_{tehran_now().strftime('%Y%m%d_%H%M')}.xlsx"
-            try:
-                path, live_data = run_once(conn, report_path)
-                telegram_send_document(path, "گزارش لحظه‌ای TSETMC تا این ساعت")
-            except Exception as e:
-                telegram_send_message(f"ساخت گزارش ناموفق بود: {e}")
+            path = None
+            if report_state:
+                path = report_state.get("path")
+            if path and Path(path).exists():
+                age = int(max(0, time.time() - report_state.get("ts", time.time())) / 60)
+                telegram_send_document(path, f"آخرین گزارش کامل TSETMC — حدود {age} دقیقه قبل")
+            else:
+                telegram_send_message("گزارش کامل هنوز ساخته نشده؛ حداکثر تا رفرش ۵ دقیقه‌ای بعدی آماده می‌شود.")
         elif text.startswith("/status"):
             telegram_send_message(build_status_text(live_data))
     return offset, live_data
 
 
+def heavy_worker(stop_event, report_state, report_lock):
+    """Run heavy collection/report generation every 5 minutes without blocking fast snapshots."""
+    conn = connect_db()
+    try:
+        ensure_bootstrap(conn)
+        while not stop_event.is_set():
+            started = time.time()
+            out = APP_DIR / f"TSETMC_HEAVY_{tehran_now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            try:
+                path, _ = run_once(conn, out)
+                with report_lock:
+                    report_state["path"] = str(path)
+                    report_state["ts"] = time.time()
+                print(f"Heavy refresh ready: {Path(path).name}")
+            except Exception as e:
+                print("Heavy refresh failed:", e)
+
+            elapsed = time.time() - started
+            wait_for = max(5, HEAVY_REFRESH_SECONDS - elapsed)
+            stop_event.wait(wait_for)
+    finally:
+        conn.close()
+
+
 def collector_main():
     print("=" * 58)
-    print("TSETMC AUTOMATIC COLLECTOR")
+    print("TSETMC AUTOMATIC COLLECTOR — FAST 30s / HEAVY 5m")
     print("=" * 58)
     print("Local DB:", DB_PATH)
     print("Iran proxies configured:", len(TSETMC_PROXIES))
+    print("Fast interval:", SNAPSHOT_SECONDS, "sec")
+    print("Heavy interval:", HEAVY_REFRESH_SECONDS, "sec")
 
     conn = connect_db()
+    stop_event = threading.Event()
+    report_state = {"path": None, "ts": 0.0}
+    report_lock = threading.Lock()
+    heavy_thread = None
+
     try:
         ensure_bootstrap(conn)
         offset = None
         live_data = []
-        last_output = None
+        last_fast_time = 0.0
 
-        # Consume old Telegram updates so commands from previous days are not replayed.
         old, offset = telegram_get_updates(None)
         print(f"Telegram ready; ignored {len(old)} old update(s).")
-        telegram_send_message("✅ Collector آماده است؛ حالا /status یا /report را بفرست.")
+        telegram_send_message("✅ Collector آماده است؛ Fast هر ۳۰ ثانیه و Heavy هر ۵ دقیقه فعال است.")
 
         now = tehran_now()
         if hhmmss(now) < MARKET_START_HHMMSS:
@@ -2567,36 +2692,55 @@ def collector_main():
             clock = hhmmss(now)
 
             if clock < MARKET_START_HHMMSS:
-                time.sleep(min(30, SNAPSHOT_SECONDS))
+                offset, live_data = handle_telegram_commands(conn, live_data, offset, report_state)
+                time.sleep(3)
                 continue
 
             if clock > MARKET_END_HHMMSS:
                 break
 
-            cycle_started = time.time()
-            try:
-                last_output, live_data = run_once(conn)
-            except Exception as e:
-                print("Cycle failed:", e)
-                telegram_send_message(f"هشدار Collector: {e}")
+            if heavy_thread is None:
+                heavy_thread = threading.Thread(
+                    target=heavy_worker,
+                    args=(stop_event, report_state, report_lock),
+                    daemon=True,
+                    name="tsetmc-heavy",
+                )
+                heavy_thread.start()
 
-            offset, live_data = handle_telegram_commands(conn, live_data, offset)
+            # Fast snapshot cadence is measured from cycle start, not cycle end.
+            now_ts = time.time()
+            if now_ts - last_fast_time >= SNAPSHOT_SECONDS:
+                last_fast_time = now_ts
+                try:
+                    live_data = run_fast_snapshot(conn)
+                except Exception as e:
+                    print("Fast cycle failed:", e)
+                    telegram_send_message(f"هشدار Fast Collector: {e}")
 
-            sleep_for = max(1, SNAPSHOT_SECONDS - (time.time() - cycle_started))
-            time.sleep(sleep_for)
+            # Poll Telegram frequently, independent of 30-second market snapshots.
+            offset, live_data = handle_telegram_commands(conn, live_data, offset, report_state)
+            time.sleep(2)
 
-        # One final post-market snapshot/report.
+        stop_event.set()
+        if heavy_thread is not None:
+            heavy_thread.join(timeout=10)
+
         final_path = APP_DIR / f"TSETMC_FINAL_{tehran_now().strftime('%Y%m%d_%H%M')}.xlsx"
         try:
-            final_path, live_data = run_once(conn, final_path)
+            final_path, final_live = run_once(conn, final_path)
             telegram_send_document(final_path, "گزارش نهایی بازار امروز")
-            telegram_send_message(build_status_text(live_data))
+            telegram_send_message(build_status_text(final_live))
         except Exception as e:
             print("Final report failed:", e)
-            if last_output:
-                telegram_send_document(last_output, "آخرین گزارش موجود امروز")
+            with report_lock:
+                fallback = report_state.get("path")
+            if fallback and Path(fallback).exists():
+                telegram_send_document(fallback, "آخرین گزارش کامل موجود امروز")
+
         print("Collector finished for today.")
     finally:
+        stop_event.set()
         conn.close()
 
 
