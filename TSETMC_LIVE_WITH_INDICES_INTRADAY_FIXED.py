@@ -55,6 +55,23 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
+TSETMC_PROXY = os.getenv("TSETMC_PROXY")
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+})
+
+if TSETMC_PROXY:
+    session.proxies.update({
+        "http": TSETMC_PROXY,
+        "https": TSETMC_PROXY,
+    })
 # ============================================================
 # SETTINGS
 # ============================================================
