@@ -19,7 +19,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-              - name: Test Iran proxy
+
+      - name: Test Iran proxy
         env:
           TSETMC_PROXY: ${{ secrets.TSETMC_PROXY }}
         run: |
@@ -30,6 +31,7 @@ jobs:
           curl -m 20 -I -x "$TSETMC_PROXY" \
             -A "Mozilla/5.0" \
             https://cdn.tsetmc.com
+
       - name: Run TSETMC script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
