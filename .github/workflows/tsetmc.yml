@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # 08:55 Iran time (UTC+3:30), Saturday through Wednesday
-    - cron: '25 5 * * 6,0-3'
+    - cron: '10 5 * * 0-3,6'
 
 jobs:
   collect:
