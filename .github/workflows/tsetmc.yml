@@ -27,9 +27,10 @@ jobs:
         env:
           TSETMC_PROXY: ${{ secrets.TSETMC_PROXY }}
         run: |
-          echo 'Testing Iran proxy...'
-          curl --fail --silent --show-error -m 20 -x "$TSETMC_PROXY" https://api.ipify.org || true
-          echo ''
+          echo "Testing Iran proxy..."
+          curl -m 20 -x "$TSETMC_PROXY" https://api.ipify.org
+          echo ""
+          curl -m 20 -I -x "$TSETMC_PROXY" -A "Mozilla/5.0" https://cdn.tsetmc.com
              - name: Restore TSETMC database cache
           uses: actions/cache@v4
           with:
