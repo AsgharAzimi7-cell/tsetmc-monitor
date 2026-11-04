@@ -66,6 +66,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
+
+# Fast alerts: intentionally conservative to avoid Telegram spam.
+ALERT_COOLDOWN_SECONDS = max(30, int(os.getenv("ALERT_COOLDOWN_SECONDS", "180")))
+ALERT_MIN_SHARES = max(1, int(os.getenv("ALERT_MIN_SHARES", "200000")))
+ALERT_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("ALERT_DAILY_VOLUME_FRACTION", "0.03")))
+ORDER_ALERT_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("ORDER_ALERT_DAILY_VOLUME_FRACTION", "0.05")))
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 # ============================================================
 # SETTINGS
@@ -462,6 +468,23 @@ def connect_db():
         )
     """)
 
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS best_limits_intraday (
+            symbol TEXT NOT NULL,
+            date INTEGER NOT NULL,
+            captured_at TEXT NOT NULL,
+            level_no INTEGER NOT NULL,
+            buy_price REAL,
+            buy_volume REAL,
+            buy_count REAL,
+            sell_price REAL,
+            sell_volume REAL,
+            sell_count REAL,
+            PRIMARY KEY(symbol, date, captured_at, level_no)
+        )
+    """)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS cache (
             cache_key TEXT PRIMARY KEY,
@@ -664,6 +687,209 @@ def get_client_intraday_rows(conn, date_value=None):
     return [dict(r) for r in rows]
 
 
+
+def save_best_limits_intraday(conn, live, captured_at=None):
+    """Persist the visible order book every fast snapshot."""
+    current = live.get("current") or {}
+    symbol = live.get("symbol") or ""
+    date_value = to_int(current.get("dEven"), 0)
+    if not symbol or not date_value:
+        return
+
+    captured_at = captured_at or tehran_now().strftime("%H:%M:%S")
+    rows = live.get("best") or []
+    for i, r in enumerate(rows, 1):
+        if not isinstance(r, dict):
+            continue
+        level_no = to_int(r.get("number"), i) or i
+        conn.execute("""
+            INSERT OR REPLACE INTO best_limits_intraday(
+                symbol,date,captured_at,level_no,
+                buy_price,buy_volume,buy_count,
+                sell_price,sell_volume,sell_count
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (
+            symbol, date_value, captured_at, level_no,
+            to_float(r.get("pMeDem"), 0),
+            to_float(r.get("qTitMeDem"), 0),
+            to_float(r.get("zOrdMeDem"), 0),
+            to_float(r.get("pMeOf"), 0),
+            to_float(r.get("qTitMeOf"), 0),
+            to_float(r.get("zOrdMeOf"), 0),
+        ))
+    conn.commit()
+
+
+def get_best_limits_intraday_rows(conn, date_value=None):
+    if date_value:
+        rows = conn.execute("""
+            SELECT * FROM best_limits_intraday
+            WHERE date=?
+            ORDER BY captured_at, symbol, level_no
+        """, (date_value,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM best_limits_intraday
+            ORDER BY date, captured_at, symbol, level_no
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def previous_client_snapshot(conn, symbol, date_value, captured_at):
+    row = conn.execute("""
+        SELECT * FROM client_intraday
+        WHERE symbol=? AND date=? AND captured_at<?
+        ORDER BY captured_at DESC LIMIT 1
+    """, (symbol, date_value, captured_at)).fetchone()
+    return dict(row) if row else None
+
+
+def previous_book_snapshot(conn, symbol, date_value, captured_at):
+    row = conn.execute("""
+        SELECT captured_at FROM best_limits_intraday
+        WHERE symbol=? AND date=? AND captured_at<?
+        ORDER BY captured_at DESC LIMIT 1
+    """, (symbol, date_value, captured_at)).fetchone()
+    if not row:
+        return []
+    ts = row["captured_at"]
+    rows = conn.execute("""
+        SELECT * FROM best_limits_intraday
+        WHERE symbol=? AND date=? AND captured_at=?
+        ORDER BY level_no
+    """, (symbol, date_value, ts)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def fmt_compact_num(x):
+    x = to_float(x, 0)
+    ax = abs(x)
+    if ax >= 1_000_000_000:
+        return f"{x/1_000_000_000:.2f}B"
+    if ax >= 1_000_000:
+        return f"{x/1_000_000:.2f}M"
+    if ax >= 1_000:
+        return f"{x/1_000:.0f}K"
+    return f"{x:,.0f}"
+
+
+def pct_emoji(x):
+    x = to_float(x, 0)
+    if x > 0:
+        return "🟢"
+    if x < 0:
+        return "🔴"
+    return "⚪️"
+
+
+def alert_threshold_shares(conn, symbol, fraction=None):
+    fraction = ALERT_DAILY_VOLUME_FRACTION if fraction is None else fraction
+    rows = get_daily_rows(conn, symbol)
+    if not rows:
+        return float(ALERT_MIN_SHARES)
+    latest_date = max((to_int(r.get("date"), 0) for r in rows), default=0)
+    prev = [r for r in rows if to_int(r.get("date"), 0) < latest_date and to_float(r.get("volume"), 0) > 0]
+    prev20 = prev[-20:]
+    avg20 = sum(to_float(r.get("volume"), 0) for r in prev20) / len(prev20) if prev20 else 0
+    return max(float(ALERT_MIN_SHARES), avg20 * fraction)
+
+
+def alert_allowed(conn, key):
+    now = time.time()
+    last = to_float(meta_get(conn, f"alert_ts:{key}", "0"), 0)
+    if now - last < ALERT_COOLDOWN_SECONDS:
+        return False
+    meta_set(conn, f"alert_ts:{key}", str(now))
+    return True
+
+
+def detect_fast_alerts(conn, live, captured_at):
+    """Detect unusually concentrated real-person flow and likely order deletion/movement."""
+    alerts = []
+    current = live.get("current") or {}
+    client = live.get("client") or {}
+    symbol = live.get("symbol") or "?"
+    date_value = to_int(current.get("dEven"), 0)
+    if not date_value:
+        return alerts
+
+    prev = previous_client_snapshot(conn, symbol, date_value, captured_at)
+    if prev:
+        rbv = client_metric(client, "buy_I_Volume")
+        rsv = client_metric(client, "sell_I_Volume")
+        rbc = client_metric(client, "buy_I_Count", "buy_CountI")
+        rsc = client_metric(client, "sell_I_Count", "sell_CountI")
+
+        d_buy_v = max(0.0, rbv - to_float(prev.get("real_buy_volume"), 0))
+        d_sell_v = max(0.0, rsv - to_float(prev.get("real_sell_volume"), 0))
+        d_buy_c = max(0, to_int(rbc, 0) - to_int(prev.get("real_buy_count"), 0))
+        d_sell_c = max(0, to_int(rsc, 0) - to_int(prev.get("real_sell_count"), 0))
+        th = alert_threshold_shares(conn, symbol)
+
+        last_price = to_float(current.get("pDrCotVal"), 0)
+        py = to_float(current.get("priceYesterday"), 0)
+        last_pct = pct_change(last_price, py)
+
+        if d_buy_v >= th and d_buy_c <= 2 and alert_allowed(conn, f"{symbol}:bigbuy"):
+            alerts.append(
+                f"🚨 خرید متمرکز احتمالی — {symbol}\n"
+                f"زمان: {captured_at}\n"
+                f"افزایش خرید حقیقی: {fmt_compact_num(d_buy_v)} سهم\n"
+                f"خریدار جدید: {d_buy_c} نفر\n"
+                f"آخرین: {last_price:,.0f} {pct_emoji(last_pct)} {last_pct:+.2f}%"
+            )
+
+        if d_sell_v >= th and d_sell_c <= 2 and alert_allowed(conn, f"{symbol}:bigsell"):
+            alerts.append(
+                f"🚨 فروش متمرکز احتمالی — {symbol}\n"
+                f"زمان: {captured_at}\n"
+                f"افزایش فروش حقیقی: {fmt_compact_num(d_sell_v)} سهم\n"
+                f"فروشنده جدید: {d_sell_c} نفر\n"
+                f"آخرین: {last_price:,.0f} {pct_emoji(last_pct)} {last_pct:+.2f}%"
+            )
+
+    # Order deletion / movement: compare same-price visible levels with previous 30s book.
+    prev_book = previous_book_snapshot(conn, symbol, date_value, captured_at)
+    cur_book = live.get("best") or []
+    if prev_book and cur_book:
+        cur_by_buy = {to_float(r.get("pMeDem"), 0): r for r in cur_book if isinstance(r, dict) and to_float(r.get("pMeDem"), 0) > 0}
+        cur_by_sell = {to_float(r.get("pMeOf"), 0): r for r in cur_book if isinstance(r, dict) and to_float(r.get("pMeOf"), 0) > 0}
+
+        day_volume = to_float(current.get("qTotTran5J"), 0)
+        prev_day_volume = to_float(prev.get("volume"), 0) if prev else 0
+        traded_delta = max(0.0, day_volume - prev_day_volume)
+        oth = alert_threshold_shares(conn, symbol, ORDER_ALERT_DAILY_VOLUME_FRACTION)
+
+        for old in prev_book:
+            bp = to_float(old.get("buy_price"), 0)
+            bv = to_float(old.get("buy_volume"), 0)
+            if bp > 0 and bv >= oth:
+                newv = to_float((cur_by_buy.get(bp) or {}).get("qTitMeDem"), 0)
+                drop = bv - newv
+                if drop >= oth and traded_delta < drop * 0.5 and alert_allowed(conn, f"{symbol}:buycancel:{int(bp)}"):
+                    alerts.append(
+                        f"⚠️ حذف/جابجایی مشکوک سفارش خرید — {symbol}\n"
+                        f"زمان: {captured_at}\n"
+                        f"قیمت: {bp:,.0f}\n"
+                        f"حجم سفارش: {fmt_compact_num(bv)} → {fmt_compact_num(newv)}\n"
+                        f"کاهش: {fmt_compact_num(drop)} | معامله همان بازه: {fmt_compact_num(traded_delta)}"
+                    )
+
+            sp = to_float(old.get("sell_price"), 0)
+            sv = to_float(old.get("sell_volume"), 0)
+            if sp > 0 and sv >= oth:
+                newv = to_float((cur_by_sell.get(sp) or {}).get("qTitMeOf"), 0)
+                drop = sv - newv
+                if drop >= oth and traded_delta < drop * 0.5 and alert_allowed(conn, f"{symbol}:sellcancel:{int(sp)}"):
+                    alerts.append(
+                        f"⚠️ حذف/جابجایی مشکوک سفارش فروش — {symbol}\n"
+                        f"زمان: {captured_at}\n"
+                        f"قیمت: {sp:,.0f}\n"
+                        f"حجم سفارش: {fmt_compact_num(sv)} → {fmt_compact_num(newv)}\n"
+                        f"کاهش: {fmt_compact_num(drop)} | معامله همان بازه: {fmt_compact_num(traded_delta)}"
+                    )
+
+    return alerts
 # ============================================================
 # ONE-TIME HISTORY BOOTSTRAP
 # ============================================================
@@ -2249,6 +2475,7 @@ def write_readme(wb):
         ("CLIENT_INTRADAY", "Time-stamped cumulative buyer/seller counts, volumes, BP and net flow during the day."),
         ("CLIENT_CURRENT", "Current real/legal participation."),
         ("BEST_LIMITS", "Current top bid/ask levels."),
+        ("BEST_LIMITS_INTRADAY", "30-second order-book history for cancellation/movement analysis."),
         ("HOLDERS", "Major holders, cached for speed."),
         ("CODAL", "Recent Codal metadata, cached for speed."),
         ("MESSAGES", "Recent TSETMC messages, cached for speed."),
@@ -2362,6 +2589,9 @@ def build_output(conn, live_data, output_path, market_indices=None, index_histor
     client_intraday = get_client_intraday_rows(conn, max(market_dates) if market_dates else None)
     write_sheet(wb, "CLIENT_INTRADAY", client_intraday)
 
+    best_intraday = get_best_limits_intraday_rows(conn, max(market_dates) if market_dates else None)
+    write_sheet(wb, "BEST_LIMITS_INTRADAY", best_intraday)
+
     write_sheet(wb, "CLIENT_CURRENT", all_clients)
     write_sheet(wb, "BEST_LIMITS", all_best)
     write_sheet(wb, "HOLDERS", all_holders, rtl=True)
@@ -2451,25 +2681,36 @@ def telegram_get_updates(offset=None):
         return [], offset
 
 
-def build_status_text(live_data):
-    lines = ["TSETMC live status"]
+
+def build_status_text(conn, live_data):
+    lines = ["📊 TSETMC — وضعیت لحظه‌ای"]
     for live in live_data or []:
-        current = live.get("current") or {}
-        client = live.get("client") or {}
-        symbol = live.get("symbol") or "?"
-        rbv = client_metric(client, "buy_I_Volume")
-        rsv = client_metric(client, "sell_I_Volume")
-        rbc = client_metric(client, "buy_I_Count", "buy_CountI")
-        rsc = client_metric(client, "sell_I_Count", "sell_CountI")
-        ab = safe_div(rbv, rbc)
-        ass = safe_div(rsv, rsc)
-        bp = safe_div(ab, ass) if ab is not None and ass is not None else None
-        bp_txt = f"{bp:.2f}" if bp is not None else "-"
-        lines.append(
-            f"{symbol}: Last={to_int(current.get('pDrCotVal'),0):,} | "
-            f"B/S={to_int(rbc,0)}/{to_int(rsc,0)} | BP={bp_txt} | "
-            f"RealNet={to_int(rbv-rsv,0):,}"
-        )
+        s = make_summary(conn, live)
+        symbol = s.get("Symbol") or "?"
+        last_price = to_float(s.get("LastPrice"), 0)
+        close_price = to_float(s.get("ClosingPrice"), 0)
+        last_pct = to_float(s.get("LastChangePct"), 0)
+        close_pct = to_float(s.get("ClosingChangePct"), 0)
+        volume = to_float(s.get("LiveVolume"), 0)
+        vr20 = s.get("VolumeRatio20_Live")
+        real_net = to_float(s.get("RealNetVolume"), 0)
+
+        lines.append("")
+        lines.append(f"▪️ {symbol}")
+        lines.append(f"آخرین: {last_price:,.0f} {pct_emoji(last_pct)} {last_pct:+.2f}%")
+        lines.append(f"پایانی: {close_price:,.0f} {pct_emoji(close_pct)} {close_pct:+.2f}%")
+        vr_txt = f"{to_float(vr20,0):.2f}×" if vr20 is not None else "-"
+        lines.append(f"حجم: {fmt_compact_num(volume)} | {vr_txt} میانگین ۲۰روزه")
+        lines.append(f"خالص حقیقی: {fmt_compact_num(real_net)} {'🟢' if real_net>0 else '🔴' if real_net<0 else '⚪️'}")
+
+        # Only surface exceptional quick-decision context.
+        gap = last_pct - close_pct
+        if abs(gap) >= 1.0:
+            direction = "آخرین بالاتر از پایانی" if gap > 0 else "آخرین پایین‌تر از پایانی"
+            lines.append(f"⚠️ {direction}: {gap:+.2f} واحد درصد")
+        if vr20 is not None and to_float(vr20,0) >= 2.0:
+            lines.append(f"🔥 حجم غیرعادی: {to_float(vr20,0):.2f}× میانگین ۲۰روزه")
+
     return "\n".join(lines)
 
 
@@ -2547,7 +2788,13 @@ def run_fast_snapshot(conn):
         try:
             live = collect_fast_symbol(conn, symbol)
             live_data.append(live)
+
+            # Compare against the previous 30-second snapshot before persisting the current one.
+            for alert_text in detect_fast_alerts(conn, live, captured_at):
+                telegram_send_message(alert_text)
+
             save_client_intraday(conn, live, captured_at=captured_at)
+            save_best_limits_intraday(conn, live, captured_at=captured_at)
         except Exception as e:
             print(f"FAST {symbol} failed: {e}")
             API_STATUS.append({
@@ -2582,6 +2829,7 @@ def run_once(conn, output_path=None):
             live = collect_live_symbol(conn, symbol)
             live_data.append(live)
             save_client_intraday(conn, live, captured_at=captured_at)
+            save_best_limits_intraday(conn, live, captured_at=captured_at)
         except Exception as e:
             print(f"  FAILED: {e}")
             API_STATUS.append({
@@ -2630,7 +2878,7 @@ def handle_telegram_commands(conn, live_data, offset, report_state=None):
             else:
                 telegram_send_message("گزارش کامل هنوز ساخته نشده؛ حداکثر تا رفرش ۵ دقیقه‌ای بعدی آماده می‌شود.")
         elif text.startswith("/status"):
-            telegram_send_message(build_status_text(live_data))
+            telegram_send_message(build_status_text(conn, live_data))
     return offset, live_data
 
 
@@ -2681,7 +2929,7 @@ def collector_main():
 
         old, offset = telegram_get_updates(None)
         print(f"Telegram ready; ignored {len(old)} old update(s).")
-        telegram_send_message("✅ Collector آماده است؛ Fast هر ۳۰ ثانیه و Heavy هر ۵ دقیقه فعال است.")
+        telegram_send_message("✅ Collector آماده است؛ Fast و سفارش‌ها هر ۳۰ ثانیه، Heavy هر ۵ دقیقه، هشدار غیرعادی فعال است.")
 
         now = tehran_now()
         if hhmmss(now) < MARKET_START_HHMMSS:
@@ -2730,7 +2978,7 @@ def collector_main():
         try:
             final_path, final_live = run_once(conn, final_path)
             telegram_send_document(final_path, "گزارش نهایی بازار امروز")
-            telegram_send_message(build_status_text(final_live))
+            telegram_send_message(build_status_text(conn, final_live))
         except Exception as e:
             print("Final report failed:", e)
             with report_lock:
