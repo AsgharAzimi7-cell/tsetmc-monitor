@@ -930,6 +930,33 @@ def estimate_trade_value_toman(shares, price_rial):
     return to_float(shares, 0) * to_float(price_rial, 0) / 10.0
 
 
+def real_buyer_power(buy_volume, sell_volume, buy_count, sell_count):
+    """Buyer/seller mean-volume ratio; use cumulative day counts for daily BP.
+
+    With count deltas this is only a proxy: traders already counted earlier
+    may also trade in the interval, so the deltas are not active-trader counts.
+    Missing/zero inputs must not turn into zero or infinite buyer power.
+    """
+    values = [to_float(x, 0) for x in (buy_volume, sell_volume, buy_count, sell_count)]
+    if any(not math.isfinite(x) or x <= 0 for x in values):
+        return None
+    buy_volume, sell_volume, buy_count, sell_count = values
+    return (buy_volume / buy_count) / (sell_volume / sell_count)
+
+
+def format_real_buyer_power(buy_volume, sell_volume, buy_count, sell_count, previous):
+    bp = real_buyer_power(buy_volume, sell_volume, buy_count, sell_count)
+    old_bp = real_buyer_power(
+        previous.get("real_buy_volume"), previous.get("real_sell_volume"),
+        previous.get("real_buy_count"), previous.get("real_sell_count"),
+    )
+    if bp is None:
+        return "BP تجمعی امروز: محاسبه‌پذیر نیست\n"
+    description = "سرانه خرید بیشتر" if bp > 1 else "سرانه فروش بیشتر" if bp < 1 else "سرانه‌ها برابر"
+    comparison = f" | قبلی: {old_bp:.2f}" if old_bp is not None else ""
+    return f"BP تجمعی امروز: {bp:.2f}{comparison} — {description}\n"
+
+
 def format_legal_flow(buy_v, sell_v, price_rial, buy_count_delta=0, sell_count_delta=0, label="حقوقی همان بازه"):
     """Human-readable legal/institutional flow from ClientType data.
 
@@ -1030,7 +1057,7 @@ def alert_allowed(conn, key, cooldown_seconds=None):
 
 
 def detect_fast_alerts(conn, live, captured_at):
-    """Detect unusually concentrated real-person flow and likely order deletion/movement."""
+    """Detect heavy real-person flow and likely order deletion/movement."""
     alerts = []
     current = live.get("current") or {}
     client = live.get("client") or {}
@@ -1068,101 +1095,45 @@ def detect_fast_alerts(conn, live, captured_at):
             d_legal_buy_v, d_legal_sell_v, last_price, d_legal_buy_c, d_legal_sell_c
         )
 
-        if d_buy_v >= th and d_buy_c <= CONCENTRATED_MAX_NEW_PEOPLE and alert_allowed(conn, f"{symbol}:bigbuy"):
+        # Preserve the existing volume/count trigger, but report both sides once.
+        # Cumulative count changes cannot establish who traded the interval volume.
+        client_counters_valid = all(
+            math.isfinite(now) and now >= to_float(prev.get(field), 0)
+            for now, field in (
+                (rbv, "real_buy_volume"), (rsv, "real_sell_volume"),
+                (rbc, "real_buy_count"), (rsc, "real_sell_count"),
+            )
+        )
+        heavy_buy = d_buy_v >= th and d_buy_c <= CONCENTRATED_MAX_NEW_PEOPLE
+        heavy_sell = d_sell_v >= th and d_sell_c <= CONCENTRATED_MAX_NEW_PEOPLE
+        if client_counters_valid and (heavy_buy or heavy_sell) and alert_allowed(conn, f"{symbol}:realflow"):
             buy_value_toman = estimate_trade_value_toman(d_buy_v, last_price)
             sell_value_toman = estimate_trade_value_toman(d_sell_v, last_price)
             net_volume = d_buy_v - d_sell_v
             net_value_toman = estimate_trade_value_toman(abs(net_volume), last_price)
-
-            if d_buy_c > 0:
-                avg_shares = d_buy_v / d_buy_c
-                avg_value_toman = buy_value_toman / d_buy_c
-                people_line = (
-                    f"خریداران جدید قوی احتمالی: {d_buy_c} نفر\n"
-                    f"میانگین تقریبی خرید هر خریدار جدید: {fmt_compact_num(avg_shares)} سهم ≈ {fmt_toman(avg_value_toman)} تومان\n"
-                )
-            else:
-                people_line = "خریدار جدیدی اضافه نشده؛ خریداران قبلی خرید سنگین را ادامه داده‌اند.\n"
-
-            if d_sell_c > 0:
-                sell_avg_shares = d_sell_v / d_sell_c if d_sell_v > 0 else 0
-                sell_avg_value = sell_value_toman / d_sell_c if d_sell_c > 0 else 0
-                counter_line = (
-                    f"سمت فروش همان بازه: {fmt_compact_num(d_sell_v)} سهم ≈ {fmt_toman(sell_value_toman)} تومان\n"
-                    f"فروشندگان جدید اضافه‌شده: {d_sell_c} نفر | میانگین تقریبی هر نفر: "
-                    f"{fmt_compact_num(sell_avg_shares)} سهم ≈ {fmt_toman(sell_avg_value)} تومان\n"
-                )
-            else:
-                counter_line = (
-                    f"سمت فروش همان بازه: {fmt_compact_num(d_sell_v)} سهم ≈ {fmt_toman(sell_value_toman)} تومان\n"
-                    f"فروشنده جدیدی اضافه نشده؛ فروش از سوی فروشندگان قبلی انجام شده است.\n"
-                )
-
             net_sign = "+" if net_volume > 0 else "-" if net_volume < 0 else ""
-            net_side = "ورود حقیقی" if net_volume > 0 else "خروج حقیقی" if net_volume < 0 else "خالص حقیقی صفر"
+            net_side = "ورود حقیقی" if net_volume > 0 else "خروج حقیقی"
             net_line = (
                 f"خالص حقیقی بازه: {net_sign}{fmt_compact_num(abs(net_volume))} سهم"
                 + (f" ≈ {fmt_toman(net_value_toman)} تومان {net_side}" if net_volume != 0 else "")
                 + "\n"
             )
+            daily_bp_line = format_real_buyer_power(rbv, rsv, rbc, rsc, prev)
+            interval_proxy = real_buyer_power(d_buy_v, d_sell_v, d_buy_c, d_sell_c)
+            if interval_proxy is None:
+                interval_line = "نسبت تقریبی بازه: محاسبه‌پذیر نیست (حجم یا افزایش تعداد صفر است)\n"
+            else:
+                interval_line = f"نسبت تقریبی بازه (حجم/افزایش تعداد): {interval_proxy:.2f}\n"
+            interval_line += "این نسبت BP واقعی بازه نیست؛ تعداد افراد فعال در بازه مشخص نیست.\n"
 
             alerts.append(
-                f"🚨 خرید متمرکز احتمالی — {symbol}\n"
-                f"زمان: {captured_at}\n"
-                f"حجم خرید حقیقی بازه: {fmt_compact_num(d_buy_v)} سهم\n"
-                f"ارزش تقریبی خرید: {fmt_toman(buy_value_toman)} تومان\n"
-                f"{people_line}"
-                f"{counter_line}"
-                f"{net_line}"
-                f"{legal_line_30s}"
-                f"آخرین: {fmt_price_pct(last_price, pct=last_pct)} {pct_emoji(last_pct)}"
-            )
-
-        if d_sell_v >= th and d_sell_c <= CONCENTRATED_MAX_NEW_PEOPLE and alert_allowed(conn, f"{symbol}:bigsell"):
-            sell_value_toman = estimate_trade_value_toman(d_sell_v, last_price)
-            buy_value_toman = estimate_trade_value_toman(d_buy_v, last_price)
-            net_volume = d_buy_v - d_sell_v
-            net_value_toman = estimate_trade_value_toman(abs(net_volume), last_price)
-
-            if d_sell_c > 0:
-                avg_shares = d_sell_v / d_sell_c
-                avg_value_toman = sell_value_toman / d_sell_c
-                people_line = (
-                    f"فروشندگان جدید قوی احتمالی: {d_sell_c} نفر\n"
-                    f"میانگین تقریبی فروش هر فروشنده جدید: {fmt_compact_num(avg_shares)} سهم ≈ {fmt_toman(avg_value_toman)} تومان\n"
-                )
-            else:
-                people_line = "فروشنده جدیدی اضافه نشده؛ فروشندگان قبلی فروش سنگین را ادامه داده‌اند.\n"
-
-            if d_buy_c > 0:
-                buy_avg_shares = d_buy_v / d_buy_c if d_buy_v > 0 else 0
-                buy_avg_value = buy_value_toman / d_buy_c if d_buy_c > 0 else 0
-                counter_line = (
-                    f"سمت خرید همان بازه: {fmt_compact_num(d_buy_v)} سهم ≈ {fmt_toman(buy_value_toman)} تومان\n"
-                    f"خریداران جدید اضافه‌شده: {d_buy_c} نفر | میانگین تقریبی هر نفر: "
-                    f"{fmt_compact_num(buy_avg_shares)} سهم ≈ {fmt_toman(buy_avg_value)} تومان\n"
-                )
-            else:
-                counter_line = (
-                    f"سمت خرید همان بازه: {fmt_compact_num(d_buy_v)} سهم ≈ {fmt_toman(buy_value_toman)} تومان\n"
-                    f"خریدار جدیدی اضافه نشده؛ خرید از سوی خریداران قبلی انجام شده است.\n"
-                )
-
-            net_sign = "+" if net_volume > 0 else "-" if net_volume < 0 else ""
-            net_side = "ورود حقیقی" if net_volume > 0 else "خروج حقیقی" if net_volume < 0 else "خالص حقیقی صفر"
-            net_line = (
-                f"خالص حقیقی بازه: {net_sign}{fmt_compact_num(abs(net_volume))} سهم"
-                + (f" ≈ {fmt_toman(net_value_toman)} تومان {net_side}" if net_volume != 0 else "")
-                + "\n"
-            )
-
-            alerts.append(
-                f"🚨 فروش متمرکز احتمالی — {symbol}\n"
-                f"زمان: {captured_at}\n"
-                f"حجم فروش حقیقی بازه: {fmt_compact_num(d_sell_v)} سهم\n"
-                f"ارزش تقریبی فروش: {fmt_toman(sell_value_toman)} تومان\n"
-                f"{people_line}"
-                f"{counter_line}"
+                f"🚨 معاملات سنگین حقیقی — {symbol}\n"
+                f"بازه: {prev.get('captured_at') or '-'} → {captured_at}\n"
+                f"{daily_bp_line}"
+                f"{interval_line}"
+                f"خرید حقیقی: {fmt_compact_num(d_buy_v)} سهم ≈ {fmt_toman(buy_value_toman)} تومان\n"
+                f"فروش حقیقی: {fmt_compact_num(d_sell_v)} سهم ≈ {fmt_toman(sell_value_toman)} تومان\n"
+                f"افزایش تعداد تجمعی: خریدار +{d_buy_c} | فروشنده +{d_sell_c}\n"
                 f"{net_line}"
                 f"{legal_line_30s}"
                 f"آخرین: {fmt_price_pct(last_price, pct=last_pct)} {pct_emoji(last_pct)}"
