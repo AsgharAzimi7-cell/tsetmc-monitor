@@ -39,6 +39,14 @@ jobs:
           key: tsetmc-db-${{ github.run_id }}
           restore-keys: |
             tsetmc-db-
+      - name: Test Telegram channel
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHANNEL_ID}" \
+            --data-urlencode "text=✅ اتصال بات به کانال با موفقیت برقرار شد"
       - name: Run TSETMC collector
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
