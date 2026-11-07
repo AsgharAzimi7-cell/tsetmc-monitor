@@ -43,6 +43,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           TSETMC_PROXY: ${{ secrets.TSETMC_PROXY }}
           TSETMC_PROXIES: ${{ secrets.TSETMC_PROXIES }}
           COLLECTOR_MODE: '1'
