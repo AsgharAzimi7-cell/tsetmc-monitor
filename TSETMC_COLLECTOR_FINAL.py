@@ -63,6 +63,7 @@ if TSETMC_PROXY and TSETMC_PROXY not in TSETMC_PROXIES:
     TSETMC_PROXIES.insert(0, TSETMC_PROXY)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
@@ -3225,40 +3226,68 @@ def telegram_session():
     return s
 
 
-def telegram_send_message(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def telegram_send_message(text, chat_id=None):
+    target = str(chat_id or TELEGRAM_CHAT_ID).strip()
+    if not TELEGRAM_BOT_TOKEN or not target:
         return False
     try:
         s = telegram_session()
         r = s.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            data={"chat_id": target, "text": text},
             timeout=30,
         )
         r.raise_for_status()
         return True
     except Exception as e:
-        print("Telegram message failed:", e)
+        print(f"Telegram message failed for {target}:", e)
         return False
 
 
-def telegram_send_document(path, caption=""):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not Path(path).exists():
+def telegram_send_document(path, caption="", chat_id=None):
+    target = str(chat_id or TELEGRAM_CHAT_ID).strip()
+    if not TELEGRAM_BOT_TOKEN or not target or not Path(path).exists():
         return False
     try:
         s = telegram_session()
         with open(path, "rb") as f:
             r = s.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                data={"chat_id": target, "caption": caption},
                 files={"document": f},
                 timeout=120,
             )
         r.raise_for_status()
         return True
     except Exception as e:
-        print("Telegram document failed:", e)
+        print(f"Telegram document failed for {target}:", e)
         return False
+
+
+def telegram_broadcast_message(text):
+    """Send market alerts/status broadcasts to the private chat and configured channel."""
+    targets = []
+    for target in (TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID):
+        target = str(target or "").strip()
+        if target and target not in targets:
+            targets.append(target)
+    ok = False
+    for target in targets:
+        ok = telegram_send_message(text, chat_id=target) or ok
+    return ok
+
+
+def telegram_broadcast_document(path, caption=""):
+    """Send a report document to the private chat and configured channel."""
+    targets = []
+    for target in (TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID):
+        target = str(target or "").strip()
+        if target and target not in targets:
+            targets.append(target)
+    ok = False
+    for target in targets:
+        ok = telegram_send_document(path, caption=caption, chat_id=target) or ok
+    return ok
 
 
 def telegram_get_updates(offset=None):
@@ -3425,7 +3454,7 @@ def run_fast_snapshot(conn):
 
             # Compare against the previous 30-second snapshot before persisting the current one.
             for alert_text in detect_fast_alerts(conn, live, captured_at):
-                telegram_send_message(alert_text)
+                telegram_broadcast_message(alert_text)
 
             save_client_intraday(conn, live, captured_at=captured_at)
             save_best_limits_intraday(conn, live, captured_at=captured_at)
@@ -3611,14 +3640,14 @@ def collector_main():
         final_path = APP_DIR / f"TSETMC_FINAL_{tehran_now().strftime('%Y%m%d_%H%M')}.xlsx"
         try:
             final_path, final_live = run_once(conn, final_path)
-            telegram_send_document(final_path, "گزارش نهایی بازار امروز")
-            telegram_send_message(build_status_text(conn, final_live))
+            telegram_broadcast_document(final_path, "گزارش نهایی بازار امروز")
+            telegram_broadcast_message(build_status_text(conn, final_live))
         except Exception as e:
             print("Final report failed:", e)
             with report_lock:
                 fallback = report_state.get("path")
             if fallback and Path(fallback).exists():
-                telegram_send_document(fallback, "آخرین گزارش کامل موجود امروز")
+                telegram_broadcast_document(fallback, "آخرین گزارش کامل موجود امروز")
 
         print("Collector finished for today.")
     finally:
