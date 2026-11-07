@@ -932,31 +932,53 @@ def estimate_trade_value_toman(shares, price_rial):
 def format_legal_flow(buy_v, sell_v, price_rial, buy_count_delta=0, sell_count_delta=0, label="حقوقی همان بازه"):
     """Human-readable legal/institutional flow from ClientType data.
 
-    Counts are reported as changes versus the reference snapshot.  We do not
+    Zero-only fields are suppressed to keep alerts concise. If there is no
+    legal/institutional activity at all in the interval, return an empty string.
+    Counts are reported as changes versus the reference snapshot. We do not
     infer whether visible bid/ask orders belong to real or legal participants.
     """
     buy_v = max(0.0, to_float(buy_v, 0))
     sell_v = max(0.0, to_float(sell_v, 0))
     buy_count_delta = max(0, to_int(buy_count_delta, 0))
     sell_count_delta = max(0, to_int(sell_count_delta, 0))
-    buy_value = estimate_trade_value_toman(buy_v, price_rial)
-    sell_value = estimate_trade_value_toman(sell_v, price_rial)
+
+    # Nothing happened on the legal side: omit the whole block.
+    if buy_v <= 0 and sell_v <= 0 and buy_count_delta <= 0 and sell_count_delta <= 0:
+        return ""
+
+    lines = []
+    flow_parts = []
+    if buy_v > 0:
+        buy_value = estimate_trade_value_toman(buy_v, price_rial)
+        flow_parts.append(
+            f"خرید {fmt_compact_num(buy_v)} سهم ≈ {fmt_toman(buy_value)} تومان"
+        )
+    if sell_v > 0:
+        sell_value = estimate_trade_value_toman(sell_v, price_rial)
+        flow_parts.append(
+            f"فروش {fmt_compact_num(sell_v)} سهم ≈ {fmt_toman(sell_value)} تومان"
+        )
+    if flow_parts:
+        lines.append(f"{label}: " + " | ".join(flow_parts))
+
     net_v = buy_v - sell_v
-    net_value = estimate_trade_value_toman(abs(net_v), price_rial)
+    if net_v != 0:
+        net_value = estimate_trade_value_toman(abs(net_v), price_rial)
+        if net_v > 0:
+            net_desc = f"+{fmt_compact_num(net_v)} سهم ≈ {fmt_toman(net_value)} تومان خالص خرید حقوقی 🟢"
+        else:
+            net_desc = f"-{fmt_compact_num(abs(net_v))} سهم ≈ {fmt_toman(net_value)} تومان خالص فروش حقوقی 🔴"
+        lines.append(f"خالص حقوقی: {net_desc}")
 
-    if net_v > 0:
-        net_desc = f"+{fmt_compact_num(net_v)} سهم ≈ {fmt_toman(net_value)} تومان خالص خرید حقوقی 🟢"
-    elif net_v < 0:
-        net_desc = f"-{fmt_compact_num(abs(net_v))} سهم ≈ {fmt_toman(net_value)} تومان خالص فروش حقوقی 🔴"
-    else:
-        net_desc = "صفر"
+    count_parts = []
+    if buy_count_delta > 0:
+        count_parts.append(f"خریدار +{buy_count_delta}")
+    if sell_count_delta > 0:
+        count_parts.append(f"فروشنده +{sell_count_delta}")
+    if count_parts:
+        lines.append("تغییر تعداد حقوقی‌ها: " + " | ".join(count_parts))
 
-    return (
-        f"{label}: خرید {fmt_compact_num(buy_v)} سهم ≈ {fmt_toman(buy_value)} تومان | "
-        f"فروش {fmt_compact_num(sell_v)} سهم ≈ {fmt_toman(sell_value)} تومان\n"
-        f"خالص حقوقی: {net_desc}\n"
-        f"تغییر تعداد حقوقی‌ها: خریدار +{buy_count_delta} | فروشنده +{sell_count_delta}\n"
-    )
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def book_state(book):
