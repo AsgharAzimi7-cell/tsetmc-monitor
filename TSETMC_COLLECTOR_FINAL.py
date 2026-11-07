@@ -995,10 +995,26 @@ def alert_money(value):
     return alert_ltr(f"{value:,.0f}") + " تومان"
 
 
+def format_estimated_side_average(side, volume, new_people, price):
+    """Estimate per-new-participant flow; keep totals if there are no new people."""
+    if new_people > 0:
+        volume = volume / new_people
+        label = f"سرانه تخمینی {side} ({alert_ltr(f'{new_people:,.0f}')} نفر جدید)"
+    else:
+        label = f"{side} حقیقی"
+    line = f"{label}: {alert_shares(volume)}"
+    if price > 0:
+        line += " ≈ " + alert_money(estimate_trade_value_toman(volume, price))
+    return line
+
+
 def format_market_alert(title, symbol, captured_at, sections, minutes=None):
     time_line = "🕒 " + alert_ltr(captured_at)
     if minutes is not None:
-        time_line += " · " + alert_ltr(f"{minutes:.1f}") + " دقیقه"
+        if minutes < 1:
+            time_line += " · " + alert_ltr(f"{minutes*60:.0f}") + " ثانیه"
+        else:
+            time_line += " · " + alert_ltr(f"{minutes:.1f}") + " دقیقه"
     header = f"{title} — {symbol}\n{time_line}"
     return "\n\n".join([header] + [s.strip() for s in sections if s and s.strip()])
 
@@ -1051,17 +1067,15 @@ def format_trade_window_alert(conn, live, reference, captured_at, title, extra="
     ratio_lines = []
     if valid:
         buy, sell, buyers, sellers = [new-old for new, old in zip(totals, old_totals)]
-        for label, volume in (("خرید حقیقی", buy), ("فروش حقیقی", sell)):
-            line = f"{label}: {alert_shares(volume)}"
-            if price > 0:
-                line += " ≈ " + alert_money(estimate_trade_value_toman(volume, price))
-            real_lines.append(line)
+        real_lines.append(format_estimated_side_average("خرید", buy, buyers, price))
+        real_lines.append(format_estimated_side_average("فروش", sell, sellers, price))
         net = buy - sell
-        label = "خالص ورود" if net > 0 else "خالص خروج" if net < 0 else "خالص حقیقی"
-        net_line = f"{label}: {alert_shares(abs(net))}"
-        if net != 0 and price > 0:
-            net_line += " ≈ " + alert_money(estimate_trade_value_toman(abs(net), price))
-        real_lines.append(net_line)
+        if net != 0:
+            label = "خالص ورود" if net > 0 else "خالص خروج"
+            net_line = f"{label}: {alert_shares(abs(net))}"
+            if price > 0:
+                net_line += " ≈ " + alert_money(estimate_trade_value_toman(abs(net), price))
+            real_lines.append(net_line)
         ratio_lines.append(format_interval_buyer_power(buy, sell, buyers, sellers))
     else:
         real_lines.append("حقیقی بازه: داده ناقص یا اصلاح‌شده")
