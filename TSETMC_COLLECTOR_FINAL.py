@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TSETMC LIVE FAST + MARKET INDEX + INTRADAY FIX
+TSETMC LIVE FAST + MARKET INDEX + INTRADAY FIX + MULTI-MIN MOMENTUM
 ================
 Lightweight intraday updater for Pydroid 3 / Android.
 
@@ -74,7 +74,30 @@ ALERT_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("ALERT_DAILY_VOLUME_FRA
 ORDER_ALERT_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("ORDER_ALERT_DAILY_VOLUME_FRACTION", "0.05")))
 CONCENTRATED_MAX_NEW_PEOPLE = max(1, int(os.getenv("CONCENTRATED_MAX_NEW_PEOPLE", "4")))
 SUDDEN_PRICE_PCT_30S = max(0.1, float(os.getenv("SUDDEN_PRICE_PCT_30S", "0.60")))
+# Multi-minute momentum alert: catches step-by-step aggressive buying/selling that a
+# single 30-second jump can miss (e.g. a 2% rise spread over ~4 minutes).
+MOMENTUM_MIN_SECONDS = max(60, int(os.getenv("MOMENTUM_MIN_SECONDS", "180")))
+MOMENTUM_MAX_SECONDS = max(MOMENTUM_MIN_SECONDS + 30, int(os.getenv("MOMENTUM_MAX_SECONDS", "300")))
+MOMENTUM_PRICE_PCT = max(0.2, float(os.getenv("MOMENTUM_PRICE_PCT", "1.20")))
+MOMENTUM_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("MOMENTUM_DAILY_VOLUME_FRACTION", "0.03")))
+MOMENTUM_ALERT_COOLDOWN_SECONDS = max(60, int(os.getenv("MOMENTUM_ALERT_COOLDOWN_SECONDS", "300")))
+# Positive-to-stronger-positive alert: catches acceleration that is meaningful but
+# smaller than the main 3-5 minute momentum trigger.
+POSITIVE_STRENGTHEN_PCT = max(0.2, float(os.getenv("POSITIVE_STRENGTHEN_PCT", "0.80")))
+POSITIVE_STRENGTHEN_VOLUME_FRACTION = max(0.001, float(os.getenv("POSITIVE_STRENGTHEN_VOLUME_FRACTION", "0.02")))
+POSITIVE_STRENGTHEN_COOLDOWN_SECONDS = max(60, int(os.getenv("POSITIVE_STRENGTHEN_COOLDOWN_SECONDS", "300")))
 QUEUE_MIN_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("QUEUE_MIN_DAILY_VOLUME_FRACTION", "0.03")))
+# Queue growth/shrink alert: compare the visible queue with a 3-5 minute reference,
+# so gradual queue changes are not missed by 30-second comparisons.
+QUEUE_CHANGE_MIN_SECONDS = max(60, int(os.getenv("QUEUE_CHANGE_MIN_SECONDS", "180")))
+QUEUE_CHANGE_MAX_SECONDS = max(QUEUE_CHANGE_MIN_SECONDS + 30, int(os.getenv("QUEUE_CHANGE_MAX_SECONDS", "300")))
+QUEUE_CHANGE_PCT = max(5.0, float(os.getenv("QUEUE_CHANGE_PCT", "20.0")))
+QUEUE_CHANGE_MIN_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("QUEUE_CHANGE_MIN_DAILY_VOLUME_FRACTION", "0.01")))
+QUEUE_CHANGE_COOLDOWN_SECONDS = max(60, int(os.getenv("QUEUE_CHANGE_COOLDOWN_SECONDS", "180")))
+# Institutional/legal flow alert. Triggered from ClientType cumulative deltas;
+# never infer order ownership from the visible order book.
+LEGAL_FLOW_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("LEGAL_FLOW_DAILY_VOLUME_FRACTION", "0.03")))
+LEGAL_FLOW_COOLDOWN_SECONDS = max(60, int(os.getenv("LEGAL_FLOW_COOLDOWN_SECONDS", "180")))
 VOLUME_RATIO_ALERT = max(1.0, float(os.getenv("VOLUME_RATIO_ALERT", "2.0")))
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 # ============================================================
@@ -748,6 +771,48 @@ def previous_client_snapshot(conn, symbol, date_value, captured_at):
     return dict(row) if row else None
 
 
+def _hms_to_seconds(value):
+    try:
+        hh, mm, ss = [int(x) for x in str(value).split(":")[:3]]
+        return hh * 3600 + mm * 60 + ss
+    except Exception:
+        return None
+
+
+def _seconds_to_hms(value):
+    value = max(0, min(86399, int(value)))
+    hh, rem = divmod(value, 3600)
+    mm, ss = divmod(rem, 60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def momentum_reference_snapshot(conn, symbol, date_value, captured_at):
+    """Return an intraday snapshot roughly 3-5 minutes before captured_at.
+
+    We deliberately use a wider lookback window instead of an exact timestamp,
+    because GitHub/HTTP timing can make nominal 30-second snapshots arrive a few
+    seconds late. The oldest available row in the window gives the broadest
+    3-5 minute cumulative move and volume.
+    """
+    cur_sec = _hms_to_seconds(captured_at)
+    if cur_sec is None or cur_sec < MOMENTUM_MIN_SECONDS:
+        return None
+
+    lower_sec = max(0, cur_sec - MOMENTUM_MAX_SECONDS)
+    upper_sec = max(0, cur_sec - MOMENTUM_MIN_SECONDS)
+    lower_hms = _seconds_to_hms(lower_sec)
+    upper_hms = _seconds_to_hms(upper_sec)
+
+    row = conn.execute("""
+        SELECT * FROM client_intraday
+        WHERE symbol=? AND date=?
+          AND captured_at>=? AND captured_at<=?
+        ORDER BY captured_at ASC
+        LIMIT 1
+    """, (symbol, date_value, lower_hms, upper_hms)).fetchone()
+    return dict(row) if row else None
+
+
 def latest_30s_delta(conn, symbol, date_value):
     rows = conn.execute("""
         SELECT * FROM client_intraday
@@ -792,6 +857,32 @@ def previous_book_snapshot(conn, symbol, date_value, captured_at):
     return [dict(r) for r in rows]
 
 
+def queue_reference_snapshot(conn, symbol, date_value, captured_at):
+    """Return a visible order-book snapshot roughly 3-5 minutes earlier."""
+    cur_sec = _hms_to_seconds(captured_at)
+    if cur_sec is None or cur_sec < QUEUE_CHANGE_MIN_SECONDS:
+        return []
+
+    lower_hms = _seconds_to_hms(max(0, cur_sec - QUEUE_CHANGE_MAX_SECONDS))
+    upper_hms = _seconds_to_hms(max(0, cur_sec - QUEUE_CHANGE_MIN_SECONDS))
+    row = conn.execute("""
+        SELECT captured_at FROM best_limits_intraday
+        WHERE symbol=? AND date=?
+          AND captured_at>=? AND captured_at<=?
+        ORDER BY captured_at ASC
+        LIMIT 1
+    """, (symbol, date_value, lower_hms, upper_hms)).fetchone()
+    if not row:
+        return []
+    ts = row["captured_at"]
+    rows = conn.execute("""
+        SELECT * FROM best_limits_intraday
+        WHERE symbol=? AND date=? AND captured_at=?
+        ORDER BY level_no
+    """, (symbol, date_value, ts)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def fmt_compact_num(x):
     x = to_float(x, 0)
     ax = abs(x)
@@ -817,8 +908,55 @@ def fmt_toman(x):
     return f"{x:,.0f}"
 
 
+def fmt_price_pct(price, yesterday=None, pct=None):
+    """Format every displayed price with its day change in parentheses.
+
+    Example: 2,328 (+2.96%).  If pct is supplied it is used directly;
+    otherwise it is calculated versus yesterday's price.
+    """
+    price = to_float(price, 0)
+    if price <= 0:
+        return "-"
+    if pct is None:
+        yesterday = to_float(yesterday, 0)
+        pct = pct_change(price, yesterday) if yesterday > 0 else 0.0
+    else:
+        pct = to_float(pct, 0)
+    return f"{price:,.0f} ({pct:+.2f}%)"
+
+
 def estimate_trade_value_toman(shares, price_rial):
     return to_float(shares, 0) * to_float(price_rial, 0) / 10.0
+
+
+def format_legal_flow(buy_v, sell_v, price_rial, buy_count_delta=0, sell_count_delta=0, label="حقوقی همان بازه"):
+    """Human-readable legal/institutional flow from ClientType data.
+
+    Counts are reported as changes versus the reference snapshot.  We do not
+    infer whether visible bid/ask orders belong to real or legal participants.
+    """
+    buy_v = max(0.0, to_float(buy_v, 0))
+    sell_v = max(0.0, to_float(sell_v, 0))
+    buy_count_delta = max(0, to_int(buy_count_delta, 0))
+    sell_count_delta = max(0, to_int(sell_count_delta, 0))
+    buy_value = estimate_trade_value_toman(buy_v, price_rial)
+    sell_value = estimate_trade_value_toman(sell_v, price_rial)
+    net_v = buy_v - sell_v
+    net_value = estimate_trade_value_toman(abs(net_v), price_rial)
+
+    if net_v > 0:
+        net_desc = f"+{fmt_compact_num(net_v)} سهم ≈ {fmt_toman(net_value)} تومان خالص خرید حقوقی 🟢"
+    elif net_v < 0:
+        net_desc = f"-{fmt_compact_num(abs(net_v))} سهم ≈ {fmt_toman(net_value)} تومان خالص فروش حقوقی 🔴"
+    else:
+        net_desc = "صفر"
+
+    return (
+        f"{label}: خرید {fmt_compact_num(buy_v)} سهم ≈ {fmt_toman(buy_value)} تومان | "
+        f"فروش {fmt_compact_num(sell_v)} سهم ≈ {fmt_toman(sell_value)} تومان\n"
+        f"خالص حقوقی: {net_desc}\n"
+        f"تغییر تعداد حقوقی‌ها: خریدار +{buy_count_delta} | فروشنده +{sell_count_delta}\n"
+    )
 
 
 def book_state(book):
@@ -858,10 +996,11 @@ def alert_threshold_shares(conn, symbol, fraction=None):
     return max(float(ALERT_MIN_SHARES), avg20 * fraction)
 
 
-def alert_allowed(conn, key):
+def alert_allowed(conn, key, cooldown_seconds=None):
     now = time.time()
+    cooldown = ALERT_COOLDOWN_SECONDS if cooldown_seconds is None else max(1, int(cooldown_seconds))
     last = to_float(meta_get(conn, f"alert_ts:{key}", "0"), 0)
-    if now - last < ALERT_COOLDOWN_SECONDS:
+    if now - last < cooldown:
         return False
     meta_set(conn, f"alert_ts:{key}", str(now))
     return True
@@ -876,6 +1015,7 @@ def detect_fast_alerts(conn, live, captured_at):
     date_value = to_int(current.get("dEven"), 0)
     if not date_value:
         return alerts
+    price_yesterday = to_float(current.get("priceYesterday"), 0)
 
     prev = previous_client_snapshot(conn, symbol, date_value, captured_at)
     if prev:
@@ -883,61 +1023,151 @@ def detect_fast_alerts(conn, live, captured_at):
         rsv = client_metric(client, "sell_I_Volume")
         rbc = client_metric(client, "buy_I_Count", "buy_CountI")
         rsc = client_metric(client, "sell_I_Count", "sell_CountI")
+        lbv = client_metric(client, "buy_N_Volume")
+        lsv = client_metric(client, "sell_N_Volume")
+        lbc = client_metric(client, "buy_N_Count", "buy_CountN")
+        lsc = client_metric(client, "sell_N_Count", "sell_CountN")
 
         d_buy_v = max(0.0, rbv - to_float(prev.get("real_buy_volume"), 0))
         d_sell_v = max(0.0, rsv - to_float(prev.get("real_sell_volume"), 0))
         d_buy_c = max(0, to_int(rbc, 0) - to_int(prev.get("real_buy_count"), 0))
         d_sell_c = max(0, to_int(rsc, 0) - to_int(prev.get("real_sell_count"), 0))
+        d_legal_buy_v = max(0.0, lbv - to_float(prev.get("legal_buy_volume"), 0))
+        d_legal_sell_v = max(0.0, lsv - to_float(prev.get("legal_sell_volume"), 0))
+        d_legal_buy_c = max(0, to_int(lbc, 0) - to_int(prev.get("legal_buy_count"), 0))
+        d_legal_sell_c = max(0, to_int(lsc, 0) - to_int(prev.get("legal_sell_count"), 0))
         th = alert_threshold_shares(conn, symbol)
 
         last_price = to_float(current.get("pDrCotVal"), 0)
         py = to_float(current.get("priceYesterday"), 0)
         last_pct = pct_change(last_price, py)
-
+        legal_line_30s = format_legal_flow(
+            d_legal_buy_v, d_legal_sell_v, last_price, d_legal_buy_c, d_legal_sell_c
+        )
 
         if d_buy_v >= th and d_buy_c <= CONCENTRATED_MAX_NEW_PEOPLE and alert_allowed(conn, f"{symbol}:bigbuy"):
-            total_value_toman = estimate_trade_value_toman(d_buy_v, last_price)
+            buy_value_toman = estimate_trade_value_toman(d_buy_v, last_price)
+            sell_value_toman = estimate_trade_value_toman(d_sell_v, last_price)
+            net_volume = d_buy_v - d_sell_v
+            net_value_toman = estimate_trade_value_toman(abs(net_volume), last_price)
+
             if d_buy_c > 0:
                 avg_shares = d_buy_v / d_buy_c
-                avg_value_toman = total_value_toman / d_buy_c
+                avg_value_toman = buy_value_toman / d_buy_c
                 people_line = (
                     f"خریداران جدید قوی احتمالی: {d_buy_c} نفر\n"
-                    f"میانگین تقریبی هر نفر: {fmt_compact_num(avg_shares)} سهم ≈ {fmt_toman(avg_value_toman)} تومان\n"
+                    f"میانگین تقریبی خرید هر خریدار جدید: {fmt_compact_num(avg_shares)} سهم ≈ {fmt_toman(avg_value_toman)} تومان\n"
                 )
             else:
-                people_line = "خریداران قبلی خرید سنگین را ادامه داده‌اند\n"
+                people_line = "خریدار جدیدی اضافه نشده؛ خریداران قبلی خرید سنگین را ادامه داده‌اند.\n"
+
+            if d_sell_c > 0:
+                sell_avg_shares = d_sell_v / d_sell_c if d_sell_v > 0 else 0
+                sell_avg_value = sell_value_toman / d_sell_c if d_sell_c > 0 else 0
+                counter_line = (
+                    f"سمت فروش همان بازه: {fmt_compact_num(d_sell_v)} سهم ≈ {fmt_toman(sell_value_toman)} تومان\n"
+                    f"فروشندگان جدید اضافه‌شده: {d_sell_c} نفر | میانگین تقریبی هر نفر: "
+                    f"{fmt_compact_num(sell_avg_shares)} سهم ≈ {fmt_toman(sell_avg_value)} تومان\n"
+                )
+            else:
+                counter_line = (
+                    f"سمت فروش همان بازه: {fmt_compact_num(d_sell_v)} سهم ≈ {fmt_toman(sell_value_toman)} تومان\n"
+                    f"فروشنده جدیدی اضافه نشده؛ فروش از سوی فروشندگان قبلی انجام شده است.\n"
+                )
+
+            net_sign = "+" if net_volume > 0 else "-" if net_volume < 0 else ""
+            net_side = "ورود حقیقی" if net_volume > 0 else "خروج حقیقی" if net_volume < 0 else "خالص حقیقی صفر"
+            net_line = (
+                f"خالص حقیقی بازه: {net_sign}{fmt_compact_num(abs(net_volume))} سهم"
+                + (f" ≈ {fmt_toman(net_value_toman)} تومان {net_side}" if net_volume != 0 else "")
+                + "\n"
+            )
 
             alerts.append(
                 f"🚨 خرید متمرکز احتمالی — {symbol}\n"
                 f"زمان: {captured_at}\n"
                 f"حجم خرید حقیقی بازه: {fmt_compact_num(d_buy_v)} سهم\n"
-                f"ارزش تقریبی کل: {fmt_toman(total_value_toman)} تومان\n"
+                f"ارزش تقریبی خرید: {fmt_toman(buy_value_toman)} تومان\n"
                 f"{people_line}"
-                f"فروش حقیقی همان بازه: {fmt_compact_num(d_sell_v)} سهم | +{d_sell_c} فروشنده\n"
-                f"آخرین: {last_price:,.0f} {pct_emoji(last_pct)} {last_pct:+.2f}%"
+                f"{counter_line}"
+                f"{net_line}"
+                f"{legal_line_30s}"
+                f"آخرین: {fmt_price_pct(last_price, pct=last_pct)} {pct_emoji(last_pct)}"
             )
 
         if d_sell_v >= th and d_sell_c <= CONCENTRATED_MAX_NEW_PEOPLE and alert_allowed(conn, f"{symbol}:bigsell"):
-            total_value_toman = estimate_trade_value_toman(d_sell_v, last_price)
+            sell_value_toman = estimate_trade_value_toman(d_sell_v, last_price)
+            buy_value_toman = estimate_trade_value_toman(d_buy_v, last_price)
+            net_volume = d_buy_v - d_sell_v
+            net_value_toman = estimate_trade_value_toman(abs(net_volume), last_price)
+
             if d_sell_c > 0:
                 avg_shares = d_sell_v / d_sell_c
-                avg_value_toman = total_value_toman / d_sell_c
+                avg_value_toman = sell_value_toman / d_sell_c
                 people_line = (
                     f"فروشندگان جدید قوی احتمالی: {d_sell_c} نفر\n"
-                    f"میانگین تقریبی هر نفر: {fmt_compact_num(avg_shares)} سهم ≈ {fmt_toman(avg_value_toman)} تومان\n"
+                    f"میانگین تقریبی فروش هر فروشنده جدید: {fmt_compact_num(avg_shares)} سهم ≈ {fmt_toman(avg_value_toman)} تومان\n"
                 )
             else:
-                people_line = "فروشندگان قبلی فروش سنگین را ادامه داده‌اند\n"
+                people_line = "فروشنده جدیدی اضافه نشده؛ فروشندگان قبلی فروش سنگین را ادامه داده‌اند.\n"
+
+            if d_buy_c > 0:
+                buy_avg_shares = d_buy_v / d_buy_c if d_buy_v > 0 else 0
+                buy_avg_value = buy_value_toman / d_buy_c if d_buy_c > 0 else 0
+                counter_line = (
+                    f"سمت خرید همان بازه: {fmt_compact_num(d_buy_v)} سهم ≈ {fmt_toman(buy_value_toman)} تومان\n"
+                    f"خریداران جدید اضافه‌شده: {d_buy_c} نفر | میانگین تقریبی هر نفر: "
+                    f"{fmt_compact_num(buy_avg_shares)} سهم ≈ {fmt_toman(buy_avg_value)} تومان\n"
+                )
+            else:
+                counter_line = (
+                    f"سمت خرید همان بازه: {fmt_compact_num(d_buy_v)} سهم ≈ {fmt_toman(buy_value_toman)} تومان\n"
+                    f"خریدار جدیدی اضافه نشده؛ خرید از سوی خریداران قبلی انجام شده است.\n"
+                )
+
+            net_sign = "+" if net_volume > 0 else "-" if net_volume < 0 else ""
+            net_side = "ورود حقیقی" if net_volume > 0 else "خروج حقیقی" if net_volume < 0 else "خالص حقیقی صفر"
+            net_line = (
+                f"خالص حقیقی بازه: {net_sign}{fmt_compact_num(abs(net_volume))} سهم"
+                + (f" ≈ {fmt_toman(net_value_toman)} تومان {net_side}" if net_volume != 0 else "")
+                + "\n"
+            )
 
             alerts.append(
                 f"🚨 فروش متمرکز احتمالی — {symbol}\n"
                 f"زمان: {captured_at}\n"
                 f"حجم فروش حقیقی بازه: {fmt_compact_num(d_sell_v)} سهم\n"
-                f"ارزش تقریبی کل: {fmt_toman(total_value_toman)} تومان\n"
+                f"ارزش تقریبی فروش: {fmt_toman(sell_value_toman)} تومان\n"
                 f"{people_line}"
-                f"خرید حقیقی همان بازه: {fmt_compact_num(d_buy_v)} سهم | +{d_buy_c} خریدار\n"
-                f"آخرین: {last_price:,.0f} {pct_emoji(last_pct)} {last_pct:+.2f}%"
+                f"{counter_line}"
+                f"{net_line}"
+                f"{legal_line_30s}"
+                f"آخرین: {fmt_price_pct(last_price, pct=last_pct)} {pct_emoji(last_pct)}"
             )
+
+        # Dedicated legal/institutional net-flow alert.  This is based only on
+        # ClientType trades, not on visible queue ownership.
+        legal_net_delta = d_legal_buy_v - d_legal_sell_v
+        legal_th = alert_threshold_shares(conn, symbol, LEGAL_FLOW_DAILY_VOLUME_FRACTION)
+        if abs(legal_net_delta) >= legal_th:
+            legal_side = "buy" if legal_net_delta > 0 else "sell"
+            if alert_allowed(conn, f"{symbol}:legalflow:{legal_side}", LEGAL_FLOW_COOLDOWN_SECONDS):
+                legal_title = "🏢 خرید خالص سنگین حقوقی" if legal_net_delta > 0 else "🏢 فروش خالص سنگین حقوقی"
+                opposite_real = d_buy_v - d_sell_v
+                opposite_value = estimate_trade_value_toman(abs(opposite_real), last_price)
+                if opposite_real > 0:
+                    real_desc = f"+{fmt_compact_num(opposite_real)} سهم ≈ {fmt_toman(opposite_value)} تومان ورود حقیقی"
+                elif opposite_real < 0:
+                    real_desc = f"-{fmt_compact_num(abs(opposite_real))} سهم ≈ {fmt_toman(opposite_value)} تومان خروج حقیقی"
+                else:
+                    real_desc = "صفر"
+                alerts.append(
+                    f"{legal_title} — {symbol}\n"
+                    f"زمان: {captured_at}\n"
+                    f"{legal_line_30s}"
+                    f"خالص حقیقی همان بازه: {real_desc}\n"
+                    f"آخرین: {fmt_price_pct(last_price, pct=last_pct)} {pct_emoji(last_pct)}"
+                )
 
     # Sudden price / momentum / queue-state alerts.
     if prev:
@@ -962,14 +1192,127 @@ def detect_fast_alerts(conn, live, captured_at):
                 rsv_now = client_metric(client, "sell_I_Volume")
                 d_buy_now = max(0.0, rbv_now - to_float(prev.get("real_buy_volume"), 0))
                 d_sell_now = max(0.0, rsv_now - to_float(prev.get("real_sell_volume"), 0))
+                lbv_now = client_metric(client, "buy_N_Volume")
+                lsv_now = client_metric(client, "sell_N_Volume")
+                lbc_now = client_metric(client, "buy_N_Count", "buy_CountN")
+                lsc_now = client_metric(client, "sell_N_Count", "sell_CountN")
+                d_lbuy_now = max(0.0, lbv_now - to_float(prev.get("legal_buy_volume"), 0))
+                d_lsell_now = max(0.0, lsv_now - to_float(prev.get("legal_sell_volume"), 0))
+                d_lbuy_c_now = max(0, to_int(lbc_now, 0) - to_int(prev.get("legal_buy_count"), 0))
+                d_lsell_c_now = max(0, to_int(lsc_now, 0) - to_int(prev.get("legal_sell_count"), 0))
                 alerts.append(
                     f"{icon} {direction} — {symbol}\n"
                     f"زمان: {captured_at}\n"
                     f"تغییر ۳۰ثانیه: {move_30s:+.2f}%\n"
-                    f"آخرین: {prev_last:,.0f} → {last_price:,.0f} | امروز {last_pct:+.2f}%\n"
+                    f"آخرین: {fmt_price_pct(prev_last, price_yesterday)} → {fmt_price_pct(last_price, pct=last_pct)}\n"
                     f"حجم معامله همان بازه: {fmt_compact_num(traded_delta)} سهم\n"
-                    f"خرید حقیقی بازه: {fmt_compact_num(d_buy_now)} | فروش حقیقی: {fmt_compact_num(d_sell_now)}"
+                    f"خرید حقیقی بازه: {fmt_compact_num(d_buy_now)} | فروش حقیقی: {fmt_compact_num(d_sell_now)}\n"
+                    f"{format_legal_flow(d_lbuy_now, d_lsell_now, last_price, d_lbuy_c_now, d_lsell_c_now)}"
                 )
+
+        # Multi-minute cumulative momentum. This catches a steady "buying upward"
+        # sequence that is meaningful over 3-5 minutes but never moves >=0.60%
+        # in any single 30-second slice.
+        momentum_ref = momentum_reference_snapshot(conn, symbol, date_value, captured_at)
+        if momentum_ref:
+            ref_price = to_float(momentum_ref.get("last_price"), 0)
+            ref_volume = to_float(momentum_ref.get("volume"), 0)
+            momentum_move = pct_change(last_price, ref_price) if ref_price > 0 else 0.0
+            momentum_volume = max(0.0, day_volume - ref_volume)
+            momentum_volume_threshold = alert_threshold_shares(
+                conn, symbol, MOMENTUM_DAILY_VOLUME_FRACTION
+            )
+
+            ref_sec = _hms_to_seconds(momentum_ref.get("captured_at"))
+            cur_sec = _hms_to_seconds(captured_at)
+            window_seconds = (cur_sec - ref_sec) if cur_sec is not None and ref_sec is not None else 0
+            window_minutes = window_seconds / 60.0 if window_seconds > 0 else 0.0
+
+            if abs(momentum_move) >= MOMENTUM_PRICE_PCT and momentum_volume >= momentum_volume_threshold:
+                direction_up = momentum_move > 0
+                key = "momentumup" if direction_up else "momentumdown"
+                if alert_allowed(conn, f"{symbol}:{key}", MOMENTUM_ALERT_COOLDOWN_SECONDS):
+                    rbv_now = client_metric(client, "buy_I_Volume")
+                    rsv_now = client_metric(client, "sell_I_Volume")
+                    rbc_now = client_metric(client, "buy_I_Count", "buy_CountI")
+                    rsc_now = client_metric(client, "sell_I_Count", "sell_CountI")
+
+                    m_buy_v = max(0.0, rbv_now - to_float(momentum_ref.get("real_buy_volume"), 0))
+                    m_sell_v = max(0.0, rsv_now - to_float(momentum_ref.get("real_sell_volume"), 0))
+                    m_buy_c = max(0, to_int(rbc_now, 0) - to_int(momentum_ref.get("real_buy_count"), 0))
+                    m_sell_c = max(0, to_int(rsc_now, 0) - to_int(momentum_ref.get("real_sell_count"), 0))
+                    m_net = m_buy_v - m_sell_v
+                    mlbv_now = client_metric(client, "buy_N_Volume")
+                    mlsv_now = client_metric(client, "sell_N_Volume")
+                    mlbc_now = client_metric(client, "buy_N_Count", "buy_CountN")
+                    mlsc_now = client_metric(client, "sell_N_Count", "sell_CountN")
+                    m_legal_buy_v = max(0.0, mlbv_now - to_float(momentum_ref.get("legal_buy_volume"), 0))
+                    m_legal_sell_v = max(0.0, mlsv_now - to_float(momentum_ref.get("legal_sell_volume"), 0))
+                    m_legal_buy_c = max(0, to_int(mlbc_now, 0) - to_int(momentum_ref.get("legal_buy_count"), 0))
+                    m_legal_sell_c = max(0, to_int(mlsc_now, 0) - to_int(momentum_ref.get("legal_sell_count"), 0))
+
+                    ref_day_pct = pct_change(ref_price, py) if py > 0 else 0.0
+                    if direction_up and ref_day_pct > 0 and last_pct > 0:
+                        title = "🟢 تقویت مثبت / خرید رو به بالا"
+                    elif direction_up:
+                        title = "📈 خرید رو به بالا / مومنتوم مثبت"
+                    else:
+                        title = "📉 فروش رو به پایین / مومنتوم منفی"
+
+                    alerts.append(
+                        f"{title} — {symbol}\n"
+                        f"زمان: {captured_at} | پنجره: {window_minutes:.1f} دقیقه\n"
+                        f"آخرین: {fmt_price_pct(ref_price, price_yesterday)} → {fmt_price_pct(last_price, pct=last_pct)}\n"
+                        f"تغییر قیمت در بازه: {momentum_move:+.2f}%\n"
+                        f"حجم معامله در پنجره: {fmt_compact_num(momentum_volume)} سهم\n"
+                        f"خرید حقیقی: {fmt_compact_num(m_buy_v)} | فروش حقیقی: {fmt_compact_num(m_sell_v)} | "
+                        f"خالص: {fmt_compact_num(m_net)}\n"
+                        f"خریدار جدید: +{m_buy_c} | فروشنده جدید: +{m_sell_c}\n"
+                        f"{format_legal_flow(m_legal_buy_v, m_legal_sell_v, last_price, m_legal_buy_c, m_legal_sell_c)}"
+                        f"امروز: {last_pct:+.2f}%"
+                    )
+
+            # Positive -> stronger positive acceleration. Keep it below the main
+            # momentum trigger to avoid duplicate alerts when the move is >=1.20%.
+            ref_day_pct = pct_change(ref_price, py) if py > 0 else 0.0
+            positive_strengthen = last_pct - ref_day_pct
+            positive_volume_threshold = alert_threshold_shares(
+                conn, symbol, POSITIVE_STRENGTHEN_VOLUME_FRACTION
+            )
+            if (
+                ref_day_pct > 0
+                and last_pct > 0
+                and positive_strengthen >= POSITIVE_STRENGTHEN_PCT
+                and momentum_move < MOMENTUM_PRICE_PCT
+                and momentum_volume >= positive_volume_threshold
+            ):
+                if alert_allowed(
+                    conn,
+                    f"{symbol}:positive_strengthen",
+                    POSITIVE_STRENGTHEN_COOLDOWN_SECONDS,
+                ):
+                    rbv_now = client_metric(client, "buy_I_Volume")
+                    rsv_now = client_metric(client, "sell_I_Volume")
+                    m_buy_v = max(0.0, rbv_now - to_float(momentum_ref.get("real_buy_volume"), 0))
+                    m_sell_v = max(0.0, rsv_now - to_float(momentum_ref.get("real_sell_volume"), 0))
+                    mlbv_now = client_metric(client, "buy_N_Volume")
+                    mlsv_now = client_metric(client, "sell_N_Volume")
+                    mlbc_now = client_metric(client, "buy_N_Count", "buy_CountN")
+                    mlsc_now = client_metric(client, "sell_N_Count", "sell_CountN")
+                    m_legal_buy_v = max(0.0, mlbv_now - to_float(momentum_ref.get("legal_buy_volume"), 0))
+                    m_legal_sell_v = max(0.0, mlsv_now - to_float(momentum_ref.get("legal_sell_volume"), 0))
+                    m_legal_buy_c = max(0, to_int(mlbc_now, 0) - to_int(momentum_ref.get("legal_buy_count"), 0))
+                    m_legal_sell_c = max(0, to_int(mlsc_now, 0) - to_int(momentum_ref.get("legal_sell_count"), 0))
+                    alerts.append(
+                        f"🟢 تقویت مثبت — {symbol}\n"
+                        f"زمان: {captured_at} | پنجره: {window_minutes:.1f} دقیقه\n"
+                        f"درصد روز: {ref_day_pct:+.2f}% → {last_pct:+.2f}% "
+                        f"({positive_strengthen:+.2f} واحد درصد)\n"
+                        f"آخرین: {fmt_price_pct(ref_price, price_yesterday)} → {fmt_price_pct(last_price, pct=last_pct)}\n"
+                        f"حجم معامله در پنجره: {fmt_compact_num(momentum_volume)} سهم\n"
+                        f"خرید حقیقی: {fmt_compact_num(m_buy_v)} | فروش حقیقی: {fmt_compact_num(m_sell_v)}\n"
+                        f"{format_legal_flow(m_legal_buy_v, m_legal_sell_v, last_price, m_legal_buy_c, m_legal_sell_c)}"
+                    )
 
         if prev_last_pct <= 0 < last_pct and (last_pct - prev_last_pct) >= 0.40:
             if alert_allowed(conn, f"{symbol}:turnedgreen"):
@@ -977,7 +1320,8 @@ def detect_fast_alerts(conn, live, captured_at):
                     f"🟢 تغییر فاز به مثبت — {symbol}\n"
                     f"زمان: {captured_at}\n"
                     f"درصد: {prev_last_pct:+.2f}% → {last_pct:+.2f}%\n"
-                    f"آخرین: {last_price:,.0f}"
+                    f"{format_legal_flow(d_legal_buy_v, d_legal_sell_v, last_price, d_legal_buy_c, d_legal_sell_c)}"
+                    f"آخرین: {fmt_price_pct(last_price, pct=last_pct)}"
                 )
         elif prev_last_pct >= 0 > last_pct and (prev_last_pct - last_pct) >= 0.40:
             if alert_allowed(conn, f"{symbol}:turnedred"):
@@ -985,7 +1329,8 @@ def detect_fast_alerts(conn, live, captured_at):
                     f"🔴 تغییر فاز به منفی — {symbol}\n"
                     f"زمان: {captured_at}\n"
                     f"درصد: {prev_last_pct:+.2f}% → {last_pct:+.2f}%\n"
-                    f"آخرین: {last_price:,.0f}"
+                    f"{format_legal_flow(d_legal_buy_v, d_legal_sell_v, last_price, d_legal_buy_c, d_legal_sell_c)}"
+                    f"آخرین: {fmt_price_pct(last_price, pct=last_pct)}"
                 )
 
         rows = get_daily_rows(conn, symbol)
@@ -1003,7 +1348,7 @@ def detect_fast_alerts(conn, live, captured_at):
                             f"زمان: {captured_at}\n"
                             f"حجم امروز: {fmt_compact_num(day_volume)} سهم\n"
                             f"نسبت به میانگین ۲۰روزه: {ratio20:.2f}×\n"
-                            f"آخرین: {last_price:,.0f} {pct_emoji(last_pct)} {last_pct:+.2f}%"
+                            f"آخرین: {fmt_price_pct(last_price, pct=last_pct)} {pct_emoji(last_pct)}"
                         )
 
     prev_book_for_state = previous_book_snapshot(conn, symbol, date_value, captured_at)
@@ -1019,7 +1364,7 @@ def detect_fast_alerts(conn, live, captured_at):
                     alerts.append(
                         f"🟢 صف خرید تشکیل شد — {symbol}\n"
                         f"زمان: {captured_at}\n"
-                        f"قیمت صف: {cur_q_price:,.0f}\n"
+                        f"قیمت صف: {fmt_price_pct(cur_q_price, price_yesterday)}\n"
                         f"حجم قابل مشاهده صف: {fmt_compact_num(cur_depth)} سهم"
                     )
             elif cur_state == "sell_queue" and cur_depth >= queue_threshold:
@@ -1027,7 +1372,7 @@ def detect_fast_alerts(conn, live, captured_at):
                     alerts.append(
                         f"🔴 صف فروش تشکیل شد — {symbol}\n"
                         f"زمان: {captured_at}\n"
-                        f"قیمت صف: {cur_q_price:,.0f}\n"
+                        f"قیمت صف: {fmt_price_pct(cur_q_price, price_yesterday)}\n"
                         f"حجم قابل مشاهده صف: {fmt_compact_num(cur_depth)} سهم"
                     )
             elif prev_state == "buy_queue" and cur_state == "normal":
@@ -1044,6 +1389,46 @@ def detect_fast_alerts(conn, live, captured_at):
                         f"زمان: {captured_at}\n"
                         f"حجم قبلی قابل مشاهده: {fmt_compact_num(prev_depth)} سهم"
                     )
+
+        # Queue size can change gradually without changing state. Compare with a
+        # 3-5 minute reference so both heavier and lighter queues are reported.
+        q_ref_book = queue_reference_snapshot(conn, symbol, date_value, captured_at)
+        if q_ref_book:
+            ref_state, ref_depth, ref_q_price = book_state(q_ref_book)
+            if cur_state == ref_state and cur_state in ("buy_queue", "sell_queue") and ref_depth > 0:
+                q_delta = cur_depth - ref_depth
+                q_change_pct = (q_delta / ref_depth) * 100.0
+                q_abs_threshold = max(50_000.0, alert_threshold_shares(conn, symbol, QUEUE_CHANGE_MIN_DAILY_VOLUME_FRACTION))
+                if abs(q_change_pct) >= QUEUE_CHANGE_PCT and abs(q_delta) >= q_abs_threshold:
+                    if cur_state == "sell_queue":
+                        if q_delta > 0:
+                            q_title = "🔴 صف فروش سنگین‌تر شد"
+                            q_key = "sellqueuegrow"
+                        else:
+                            q_title = "🟡 صف فروش سبک‌تر شد"
+                            q_key = "sellqueueshrink"
+                    else:
+                        if q_delta > 0:
+                            q_title = "🟢 صف خرید سنگین‌تر شد"
+                            q_key = "buyqueuegrow"
+                        else:
+                            q_title = "🟡 صف خرید سبک‌تر شد"
+                            q_key = "buyqueueshrink"
+
+                    if alert_allowed(conn, f"{symbol}:{q_key}", QUEUE_CHANGE_COOLDOWN_SECONDS):
+                        ref_queue_value_toman = estimate_trade_value_toman(ref_depth, ref_q_price or cur_q_price)
+                        cur_queue_value_toman = estimate_trade_value_toman(cur_depth, cur_q_price)
+                        delta_queue_value_toman = cur_queue_value_toman - ref_queue_value_toman
+                        alerts.append(
+                            f"{q_title} — {symbol}\n"
+                            f"زمان: {captured_at}\n"
+                            f"حجم صف: {fmt_compact_num(ref_depth)} → {fmt_compact_num(cur_depth)} سهم "
+                            f"({q_change_pct:+.1f}%)\n"
+                            f"تغییر خالص صف: {fmt_compact_num(q_delta)} سهم\n"
+                            f"ارزش تقریبی صف: {fmt_toman(ref_queue_value_toman)} → {fmt_toman(cur_queue_value_toman)} تومان\n"
+                            f"تغییر ارزش صف: {('+' if delta_queue_value_toman > 0 else '')}{fmt_toman(delta_queue_value_toman)} تومان\n"
+                            f"قیمت صف: {fmt_price_pct(cur_q_price, price_yesterday)}"
+                        )
 
     # Order deletion / movement: compare same-price visible levels with previous 30s book.
     prev_book = previous_book_snapshot(conn, symbol, date_value, captured_at)
@@ -1067,7 +1452,7 @@ def detect_fast_alerts(conn, live, captured_at):
                     alerts.append(
                         f"⚠️ حذف/جابجایی مشکوک سفارش خرید — {symbol}\n"
                         f"زمان: {captured_at}\n"
-                        f"قیمت: {bp:,.0f}\n"
+                        f"قیمت: {fmt_price_pct(bp, price_yesterday)}\n"
                         f"حجم سفارش: {fmt_compact_num(bv)} → {fmt_compact_num(newv)}\n"
                         f"کاهش: {fmt_compact_num(drop)} | معامله همان بازه: {fmt_compact_num(traded_delta)}"
                     )
@@ -1081,7 +1466,7 @@ def detect_fast_alerts(conn, live, captured_at):
                     alerts.append(
                         f"⚠️ حذف/جابجایی مشکوک سفارش فروش — {symbol}\n"
                         f"زمان: {captured_at}\n"
-                        f"قیمت: {sp:,.0f}\n"
+                        f"قیمت: {fmt_price_pct(sp, price_yesterday)}\n"
                         f"حجم سفارش: {fmt_compact_num(sv)} → {fmt_compact_num(newv)}\n"
                         f"کاهش: {fmt_compact_num(drop)} | معامله همان بازه: {fmt_compact_num(traded_delta)}"
                     )
@@ -2894,11 +3279,21 @@ def build_status_text(conn, live_data):
 
         lines.append("")
         lines.append(f"▪️ {symbol}")
-        lines.append(f"آخرین: {last_price:,.0f} {pct_emoji(last_pct)} {last_pct:+.2f}%")
-        lines.append(f"پایانی: {close_price:,.0f} {pct_emoji(close_pct)} {close_pct:+.2f}%")
+        lines.append(f"آخرین: {fmt_price_pct(last_price, pct=last_pct)} {pct_emoji(last_pct)}")
+        lines.append(f"پایانی: {fmt_price_pct(close_price, pct=close_pct)} {pct_emoji(close_pct)}")
         vr_txt = f"{to_float(vr20,0):.2f}×" if vr20 is not None else "-"
         lines.append(f"حجم: {fmt_compact_num(volume)} | {vr_txt} میانگین ۲۰روزه")
         lines.append(f"خالص حقیقی: {fmt_compact_num(real_net)} {'🟢' if real_net>0 else '🔴' if real_net<0 else '⚪️'}")
+        legal_buy = to_float(s.get("LegalBuyVolume"), 0)
+        legal_sell = to_float(s.get("LegalSellVolume"), 0)
+        legal_net = to_float(s.get("LegalNetVolume"), 0)
+        legal_net_value = estimate_trade_value_toman(abs(legal_net), last_price)
+        legal_icon = '🟢' if legal_net > 0 else '🔴' if legal_net < 0 else '⚪️'
+        legal_side = 'خالص خرید' if legal_net > 0 else 'خالص فروش' if legal_net < 0 else 'خالص صفر'
+        lines.append(
+            f"حقوقی: خرید {fmt_compact_num(legal_buy)} | فروش {fmt_compact_num(legal_sell)} | "
+            f"{legal_side} {fmt_compact_num(abs(legal_net))} سهم ≈ {fmt_toman(legal_net_value)} تومان {legal_icon}"
+        )
 
         buy_count = to_float(s.get("RealBuyCount"), 0)
         sell_count = to_float(s.get("RealSellCount"), 0)
