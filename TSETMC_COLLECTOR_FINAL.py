@@ -977,7 +977,7 @@ def alert_ltr(value):
 
 def alert_rtl_change(before, now):
     """RTL reading: previous at right, current at left; isolate numeric fragments."""
-    return "\u2067" + alert_ltr(before) + " ← " + alert_ltr(now) + "\u2069"
+    return "\u2067قبل " + alert_ltr(before) + " ← اکنون " + alert_ltr(now) + "\u2069"
 
 
 def alert_shares(value):
