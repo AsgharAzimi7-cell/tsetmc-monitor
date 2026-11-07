@@ -951,13 +951,13 @@ def format_real_buyer_power(buy_volume, sell_volume, buy_count, sell_count, prev
         previous.get("real_buy_count"), previous.get("real_sell_count"),
     )
     if bp is None:
-        return "BP روز: نامشخص"
+        return "قدرت خریدار امروز: نامشخص"
     display = alert_rtl_change(f"{old_bp:.2f}", f"{bp:.2f}") if old_bp is not None else alert_ltr(f"{bp:.2f}")
-    return f"BP روز: {display}"
+    return f"قدرت خریدار امروز: {display}"
 
 
 def format_interval_buyer_power(buy, sell, buyers, sellers):
-    label = "BP بازه (تخمینی): "
+    label = "قدرت خریدار بازه (تخمینی): "
     if buyers == 0 and sellers == 0:
         return label + "نامشخص؛ خریدار و فروشنده جدید اضافه نشدند"
     if buyers == 0:
@@ -977,7 +977,7 @@ def alert_ltr(value):
 
 def alert_rtl_change(before, now):
     """RTL reading: previous at right, current at left; isolate numeric fragments."""
-    return "\u2067قبل " + alert_ltr(before) + " ← اکنون " + alert_ltr(now) + "\u2069"
+    return "\u2067" + alert_ltr(before) + " ← " + alert_ltr(now) + "\u2069"
 
 
 def alert_shares(value):
@@ -1038,21 +1038,35 @@ def format_trade_window_alert(conn, live, reference, captured_at, title, extra="
     price_display = alert_rtl_change(fmt_price_pct(old_price, yesterday), current_display) if old_price > 0 else alert_ltr(current_display)
     price_lines = [f"قیمت: {price_display}"]
 
-    total_delta = to_float(current.get("qTotTran5J"), 0) - to_float(reference.get("volume"), 0)
-    benchmark = ""
+    day_volume = to_float(current.get("qTotTran5J"), 0)
+    total_delta = day_volume - to_float(reference.get("volume"), 0)
+    benchmark = []
     if total_delta >= 0:
         total_line = f"کل بازه: {alert_shares(total_delta)}"
         if price > 0:
             total_line += " ≈ " + alert_money(estimate_trade_value_toman(total_delta, price))
         price_lines.append(total_line)
+    else:
+        price_lines.append("کل بازه: نامشخص؛ اصلاح آمار")
+
+    if total_delta >= 0 and day_volume > 0:
+        window_share = alert_ltr(f"{100*total_delta/day_volume:.2f}%")
+        benchmark.append(f"سهم بازه از حجم امروز: {window_share}")
+    else:
+        benchmark.append("سهم بازه از حجم امروز: نامشخص")
+    if day_volume >= 0:
+        today_line = "حجم امروز: " + alert_shares(day_volume)
         rows = get_daily_rows(conn, live.get("symbol") or "?")
         date_value = to_int(current.get("dEven"), 0)
         days = [r for r in rows if to_int(r.get("date"), 0) < date_value and to_float(r.get("volume"), 0) > 0][-20:]
         if days:
             average = sum(to_float(r.get("volume"), 0) for r in days) / len(days)
-            benchmark = f"حجم بازه: {alert_ltr(f'{100*total_delta/average:.2f}%')} میانگین روزانه {len(days)} جلسه"
-    else:
-        price_lines.append("کل بازه: نامشخص؛ اصلاح آمار")
+            day_ratio = alert_ltr(f"{day_volume/average:.2f}")
+            sessions = str(len(days)).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+            today_line += f"؛ {day_ratio} برابر میانگین{sessions}روزه"
+        else:
+            today_line += "؛ نسبت به میانگین۲۰روزه نامشخص"
+        benchmark.append(today_line)
 
     fields = (
         ("real_buy_volume", ("buy_I_Volume",)), ("real_sell_volume", ("sell_I_Volume",)),
@@ -1080,8 +1094,7 @@ def format_trade_window_alert(conn, live, reference, captured_at, title, extra="
     else:
         real_lines.append("حقیقی بازه: داده ناقص یا اصلاح‌شده")
     ratio_lines.append(format_real_buyer_power(*totals, reference))
-    if benchmark:
-        ratio_lines.append(benchmark)
+    ratio_lines.extend(benchmark)
 
     legal_deltas = []
     for field, keys in (
@@ -1394,8 +1407,7 @@ def detect_fast_alerts(conn, live, captured_at):
                 if ratio20 >= VOLUME_RATIO_ALERT and prev_ratio20 < VOLUME_RATIO_ALERT:
                     if alert_allowed(conn, f"{symbol}:volumeratio"):
                         alerts.append(format_trade_window_alert(
-                            conn, live, prev, captured_at, "🔥 حجم غیرعادی",
-                            extra=f"📊 حجم امروز\nحجم امروز: {alert_shares(day_volume)}\nنسبت به میانگین حجم روزانه ۲۰ جلسه: {alert_ltr(f'{ratio20:.2f}')} برابر"
+                            conn, live, prev, captured_at, "🔥 حجم غیرعادی"
                         ))
 
     prev_book_for_state = previous_book_snapshot(conn, symbol, date_value, captured_at)
@@ -3274,7 +3286,7 @@ def telegram_send_document(path, caption="", chat_id=None):
 
 
 def telegram_broadcast_message(text):
-    """Send market alerts/status broadcasts to the private chat and configured channel."""
+    """Send intraday market alerts to the private chat and configured channel."""
     targets = []
     for target in (TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID):
         target = str(target or "").strip()
@@ -3283,19 +3295,6 @@ def telegram_broadcast_message(text):
     ok = False
     for target in targets:
         ok = telegram_send_message(text, chat_id=target) or ok
-    return ok
-
-
-def telegram_broadcast_document(path, caption=""):
-    """Send a report document to the private chat and configured channel."""
-    targets = []
-    for target in (TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID):
-        target = str(target or "").strip()
-        if target and target not in targets:
-            targets.append(target)
-    ok = False
-    for target in targets:
-        ok = telegram_send_document(path, caption=caption, chat_id=target) or ok
     return ok
 
 
@@ -3384,6 +3383,256 @@ def build_status_text(conn, live_data):
             lines.append(f"🔥 حجم غیرعادی: {to_float(vr20,0):.2f}× میانگین ۲۰روزه")
 
     return "\n".join(lines)
+
+
+def split_telegram_text(text, max_units=3500):
+    """Split at paragraph/line boundaries within Telegram's UTF-16 text budget."""
+    def units(value):
+        return len(value.encode("utf-16-le")) // 2
+
+    chunks = []
+    current = ""
+    for paragraph in str(text).strip().split("\n\n"):
+        candidate = current + ("\n\n" if current else "") + paragraph
+        if units(candidate) <= max_units:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if units(paragraph) <= max_units:
+            current = paragraph
+            continue
+        for line in paragraph.splitlines():
+            candidate = current + ("\n" if current else "") + line
+            if units(candidate) <= max_units:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+            for char in line:
+                if units(current + char) > max_units:
+                    chunks.append(current)
+                    current = ""
+                current += char
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def eod_client_history(conn, symbol, market_date):
+    rows = conn.execute("""
+        SELECT * FROM client_intraday
+        WHERE symbol=? AND date=? AND volume>0
+        ORDER BY captured_at
+    """, (symbol, market_date)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def eod_bp_history_line(rows, final_bp):
+    """Use only actual same-day samples; never synthesize missing morning BP."""
+    readings = []
+    for row in rows:
+        bp = real_buyer_power(
+            row.get("real_buy_volume"), row.get("real_sell_volume"),
+            row.get("real_buy_count"), row.get("real_sell_count"),
+        )
+        seconds = _hms_to_seconds(row.get("captured_at"))
+        if bp is not None and seconds is not None:
+            readings.append((seconds, row["captured_at"], bp))
+    if final_bp is None:
+        return "قدرت خریدار امروز: نامشخص"
+    if not readings:
+        return "قدرت خریدار در پایان: " + alert_ltr(f"{final_bp:.2f}")
+    if len(readings) == 1:
+        return "قدرت خریدار در پایان: " + alert_ltr(f"{final_bp:.2f}")
+
+    selected = [readings[0]]
+    # A representative middle reading and a late reading show the day's shape
+    # without pretending that missing hourly checkpoints were observed.
+    span = readings[-1][0]-readings[0][0]
+    if span >= 1800:
+        for target in ((readings[0][0]+readings[-1][0])/2, readings[-1][0]-900):
+            closest = min(readings, key=lambda item: abs(item[0]-target))
+            if closest not in selected and closest[0] < readings[-1][0]-120:
+                selected.append(closest)
+    selected.sort(key=lambda item: item[0])
+    points = [alert_ltr(f"{clock[:5]} ({bp:.2f})") for _, clock, bp in selected]
+    points.append("پایان " + alert_ltr(f"{final_bp:.2f}"))
+    return "قدرت خریدار امروز: " + "، ".join(points)
+
+
+def eod_late_reference(rows):
+    if len(rows) < 2:
+        return None
+    last_sec = _hms_to_seconds(rows[-1].get("captured_at"))
+    if last_sec is None:
+        return None
+    candidates = [r for r in rows if _hms_to_seconds(r.get("captured_at")) is not None]
+    if not candidates:
+        return None
+    reference = min(candidates, key=lambda r: abs(_hms_to_seconds(r["captured_at"])-(last_sec-900)))
+    return reference if last_sec-_hms_to_seconds(reference["captured_at"]) >= 180 else None
+
+
+def build_channel_eod_text(conn, live_data, report_complete=True):
+    """Factual Persian close commentary from collected prices, flows, BP and book.
+
+    This intentionally does not send a workbook or reproduce the operational
+    /status message. It interprets observed data without inventing news or BP
+    history missing after a restart.
+    """
+    now = tehran_now()
+    date_value = int(now.strftime("%Y%m%d"))
+    title = "📊 جمع‌بندی پایان بازار" if report_complete else "📊 جمع‌بندی پایان بازار — آخرین داده موجود"
+    header = [title, "تاریخ: " + alert_ltr(now.strftime("%Y/%m/%d"))]
+    try:
+        indices = json.loads(meta_get(conn, f"market_indices:{date_value}", "[]"))
+    except (ValueError, TypeError):
+        indices = []
+    for row in indices:
+        if row.get("Status") == "OK" and row.get("ChangePct") is not None:
+            index_pct = alert_ltr("{:+.2f}%".format(to_float(row["ChangePct"], 0)))
+            header.append(f"{row.get('Index')}: {index_pct}")
+
+    by_symbol = {live.get("symbol"): live for live in live_data or [] if live.get("symbol")}
+    sections = ["\n".join(header)]
+    for symbol in SYMBOLS:
+        live = by_symbol.get(symbol)
+        if not live:
+            sections.append(f"▪️ {symbol}: داده پایان بازار دریافت نشد.")
+            continue
+        try:
+            summary = make_summary(conn, live)
+            current = live.get("current") or {}
+            day = to_int(current.get("dEven"), 0)
+            volume = to_float(summary.get("LiveVolume"), 0)
+            if day != date_value:
+                sections.append(f"▪️ {symbol}: داده تازه امروز موجود نیست.")
+                continue
+            if volume <= 0:
+                sections.append(f"▪️ {symbol}: امروز معامله‌ای ثبت نشد.")
+                continue
+            last = to_float(summary.get("LastPrice"), 0)
+            close = to_float(summary.get("ClosingPrice"), 0)
+            if last <= 0:
+                sections.append(f"▪️ {symbol}: قیمت پایان بازار دریافت نشد.")
+                continue
+            day_pct = to_float(summary.get("LastChangePct"), 0)
+            bp = real_buyer_power(
+                summary.get("RealBuyVolume"), summary.get("RealSellVolume"),
+                summary.get("RealBuyCount"), summary.get("RealSellCount"),
+            )
+            rows = eod_client_history(conn, symbol, day)
+            lines = [f"{pct_emoji(day_pct)} {symbol}"]
+            lines.append("آخرین: " + alert_ltr(fmt_price_pct(last, pct=day_pct)))
+            if close > 0 and close != last:
+                lines.append("پایانی: " + alert_ltr(fmt_price_pct(close, pct=summary.get("ClosingChangePct"))))
+            lines.append(eod_bp_history_line(rows, bp))
+            ratio = summary.get("VolumeRatio20_Live")
+            activity = "حجم: " + alert_shares(volume)
+            if ratio is not None:
+                activity += "؛ " + alert_ltr(f"{to_float(ratio, 0):.2f}") + " برابر میانگین۲۰"
+            lines.append(activity)
+
+            real_net = to_float(summary.get("RealNetVolume"), 0)
+            if real_net != 0:
+                side = "ورود خالص حقیقی" if real_net > 0 else "خروج خالص حقیقی"
+                lines.append(f"{side}: {alert_shares(abs(real_net))} ≈ {alert_money(estimate_trade_value_toman(abs(real_net), last))}")
+            legal_net = to_float(summary.get("LegalNetVolume"), 0)
+            if legal_net > 0:
+                lines.append("حقوقی‌ها خریدار خالص روز بودند.")
+            elif legal_net < 0:
+                lines.append("حقوقی‌ها فروشنده خالص روز بودند.")
+
+            comments = []
+            high = to_float(summary.get("High"), 0)
+            retreat = pct_change(last, high) if high > 0 else 0
+            if high > 0 and retreat <= -1.0:
+                comments.append(f"آخرین قیمت {alert_ltr(f'{abs(retreat):.2f}%')} پایین‌تر از سقف روز قرار گرفت.")
+            elif high > 0 and day_pct > 0 and retreat >= -0.2:
+                comments.append("قیمت نزدیک سقف روز حفظ شد.")
+            if bp is not None:
+                if 0.95 <= bp <= 1.05:
+                    comments.append("سرانه خرید و فروش تقریباً برابر شد.")
+                elif bp > 1.05:
+                    comments.append("سرانه خریدار بزرگ‌تر از فروشنده بود.")
+                else:
+                    comments.append("سرانه فروشنده بزرگ‌تر از خریدار بود.")
+
+            reference = eod_late_reference(rows)
+            if reference:
+                old_bp = real_buyer_power(
+                    reference.get("real_buy_volume"), reference.get("real_sell_volume"),
+                    reference.get("real_buy_count"), reference.get("real_sell_count"),
+                )
+                if bp is not None and old_bp is not None and abs(pct_change(bp, old_bp)) >= 10:
+                    direction = "تقویت" if bp > old_bp else "تضعیف"
+                    comments.append(f"قدرت خریدار نسبت به ساعت {alert_ltr(reference['captured_at'][:5])} {direction} شد.")
+                counters_valid = (
+                    to_float(summary.get("RealBuyVolume"), 0) >= to_float(reference.get("real_buy_volume"), 0)
+                    and to_float(summary.get("RealSellVolume"), 0) >= to_float(reference.get("real_sell_volume"), 0)
+                )
+                late_net = real_net-to_float(reference.get("real_net_volume"), 0)
+                if counters_valid and abs(late_net) >= ALERT_MIN_SHARES:
+                    side = "خرید" if late_net > 0 else "فروش"
+                    comments.append(f"از ساعت {alert_ltr(reference['captured_at'][:5])} خالص {side} حقیقی {alert_shares(abs(late_net))} ثبت شد.")
+
+            book = [row for row in live.get("best", []) if isinstance(row, dict)]
+            buy_at_last = sum(max(0, to_float(r.get("qTitMeDem"), r.get("buy_volume", 0)))
+                              for r in book if to_float(r.get("pMeDem"), r.get("buy_price", 0)) == last)
+            sell_at_last = sum(max(0, to_float(r.get("qTitMeOf"), r.get("sell_volume", 0)))
+                               for r in book if to_float(r.get("pMeOf"), r.get("sell_price", 0)) == last)
+            low = to_float(summary.get("Low"), 0)
+            if last == high and buy_at_last > 0:
+                comments.append("تقاضای نمایان در سقف: " + alert_shares(buy_at_last) + ".")
+            elif last == low and sell_at_last > 0:
+                comments.append("عرضه نمایان در کف: " + alert_shares(sell_at_last) + ".")
+            rsi = summary.get("RSI14")
+            sma20 = to_float(summary.get("SMA20"), 0)
+            if rsi is not None and to_float(rsi, 0) >= 80:
+                comments.append("RSI بالا: " + alert_ltr(f"{to_float(rsi, 0):.1f}") + ".")
+            elif sma20 > 0 and close < sma20:
+                comments.append("پایانی هنوز زیر میانگین۲۰روزه است.")
+            if comments:
+                lines.insert(1, " ".join(comments))
+            sections.append("\n".join(lines))
+        except Exception as exc:
+            print(f"EOD commentary unavailable for {symbol}: {exc}")
+            sections.append(f"▪️ {symbol}: داده کافی برای جمع‌بندی موجود نیست.")
+    sections.append("قیمت‌ها ریال؛ ارزش خالص حقیقی با قیمت آخر برآورد شده است.")
+    return "\n\n".join(sections)
+
+
+def deliver_end_of_day_reports(conn, live_data, report_path=None, report_complete=True):
+    """Private Excel/status; channel receives analytical text only, including fallback."""
+    private_id = str(TELEGRAM_CHAT_ID or "").strip()
+    channel_id = str(TELEGRAM_CHANNEL_ID or "").strip()
+    result = {"private_document": False, "private_status": False, "channel_analysis": False}
+    # Never leak private reports into a channel if the two secrets were mixed up.
+    private_ok = private_id and not private_id.startswith(("-", "@")) and private_id != channel_id
+    if private_ok:
+        if report_path and Path(report_path).exists():
+            caption = "گزارش نهایی بازار امروز" if report_complete else "آخرین گزارش کامل موجود امروز"
+            result["private_document"] = telegram_send_document(report_path, caption, chat_id=private_id)
+        try:
+            status = build_status_text(conn, live_data)
+            outcomes = [telegram_send_message(part, chat_id=private_id) for part in split_telegram_text(status)]
+            result["private_status"] = bool(outcomes) and all(outcomes)
+        except Exception as exc:
+            print("Private final status failed:", exc)
+    elif private_id:
+        print("Private final reports skipped: configure a separate private TELEGRAM_CHAT_ID.")
+
+    if channel_id:
+        try:
+            text = build_channel_eod_text(conn, live_data, report_complete=report_complete)
+            outcomes = [telegram_send_message(part, chat_id=channel_id) for part in split_telegram_text(text)]
+            result["channel_analysis"] = bool(outcomes) and all(outcomes)
+        except Exception as exc:
+            print("Channel end-of-day analysis failed:", exc)
+    return result
 
 
 def collect_fast_symbol(conn, symbol):
@@ -3523,6 +3772,13 @@ def run_once(conn, output_path=None):
         })
         market_indices, index_history = [], []
 
+    if any(row.get("Status") == "OK" for row in market_indices):
+        try:
+            meta_set(conn, f"market_indices:{int(now.strftime('%Y%m%d'))}",
+                     json.dumps(market_indices, ensure_ascii=False))
+        except Exception as exc:
+            print("Market index summary cache failed:", exc)
+
     build_output(
         conn, live_data, output_path,
         market_indices=market_indices,
@@ -3647,16 +3903,20 @@ def collector_main():
             heavy_thread.join(timeout=10)
 
         final_path = APP_DIR / f"TSETMC_FINAL_{tehran_now().strftime('%Y%m%d_%H%M')}.xlsx"
+        final_live = live_data
+        report_complete = False
         try:
             final_path, final_live = run_once(conn, final_path)
-            telegram_broadcast_document(final_path, "گزارش نهایی بازار امروز")
-            telegram_broadcast_message(build_status_text(conn, final_live))
+            report_complete = True
         except Exception as e:
             print("Final report failed:", e)
             with report_lock:
                 fallback = report_state.get("path")
-            if fallback and Path(fallback).exists():
-                telegram_broadcast_document(fallback, "آخرین گزارش کامل موجود امروز")
+            final_path = fallback if fallback and Path(fallback).exists() else None
+
+        deliver_end_of_day_reports(
+            conn, final_live, report_path=final_path, report_complete=report_complete
+        )
 
         print("Collector finished for today.")
     finally:
