@@ -36,6 +36,12 @@ The light Excel contains:
     API_STATUS       = request status
 
 The full V4 history is therefore NOT downloaded on every run.
+
+Alert volume and published daily volume use one matched ClientType side
+(real + legal buys = real + legal sells). Their receipt times describe feed
+updates, not individual execution times. Official volume remains archived
+for diagnostics and order-cancellation estimates. Fast alert baselines are
+isolated from Heavy collection; the existing local database upgrades in place.
 """
 
 import csv
@@ -100,6 +106,21 @@ QUEUE_CHANGE_COOLDOWN_SECONDS = max(60, int(os.getenv("QUEUE_CHANGE_COOLDOWN_SEC
 LEGAL_FLOW_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("LEGAL_FLOW_DAILY_VOLUME_FRACTION", "0.03")))
 LEGAL_FLOW_COOLDOWN_SECONDS = max(60, int(os.getenv("LEGAL_FLOW_COOLDOWN_SECONDS", "180")))
 VOLUME_RATIO_ALERT = max(1.0, float(os.getenv("VOLUME_RATIO_ALERT", "2.0")))
+VOLUME_BURST_SAMPLE_FRACTION = max(0.001, float(os.getenv("VOLUME_BURST_SAMPLE_FRACTION", "0.05")))
+VOLUME_BURST_WINDOW_FRACTION = max(0.001, float(os.getenv("VOLUME_BURST_WINDOW_FRACTION", "0.20")))
+VOLUME_BURST_WINDOW_SECONDS = 300
+VOLUME_BURST_COOLDOWN_SECONDS = max(30, int(os.getenv("VOLUME_BURST_COOLDOWN_SECONDS", "60")))
+
+CLIENT_FIELDS = {
+    "real_buy_volume": ("buy_I_Volume",),
+    "real_sell_volume": ("sell_I_Volume",),
+    "legal_buy_volume": ("buy_N_Volume",),
+    "legal_sell_volume": ("sell_N_Volume",),
+    "real_buy_count": ("buy_I_Count", "buy_CountI"),
+    "real_sell_count": ("sell_I_Count", "sell_CountI"),
+    "legal_buy_count": ("buy_N_Count", "buy_CountN"),
+    "legal_sell_count": ("sell_N_Count", "sell_CountN"),
+}
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 # ============================================================
 # SETTINGS
@@ -425,8 +446,10 @@ def excel_safe(v):
 # ============================================================
 
 def connect_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS meta (
@@ -521,6 +544,35 @@ def connect_db():
         )
     """)
 
+    # Additive migration: retain official volumes and existing raw history.
+    for table, columns in {
+        "client_intraday": {
+            "capture_source": "TEXT DEFAULT 'legacy'",
+            "price_received_at": "TEXT",
+            "client_received_at": "TEXT",
+            "classified_volume": "REAL",
+            "client_status": "TEXT",
+        },
+        "best_limits_intraday": {"capture_source": "TEXT DEFAULT 'legacy'"},
+    }.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in columns.items():
+            if name not in existing:
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                except sqlite3.OperationalError:
+                    # The Fast/Heavy connections may migrate concurrently.
+                    if name not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                        raise
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alert_samples (
+            symbol TEXT NOT NULL, date INTEGER NOT NULL, kind TEXT NOT NULL,
+            captured_at TEXT NOT NULL, payload TEXT NOT NULL,
+            PRIMARY KEY(symbol,date,kind,captured_at)
+        )
+    """)
+    conn.execute("""CREATE INDEX IF NOT EXISTS alert_samples_lookup
+                    ON alert_samples(symbol,date,kind,captured_at)""")
     conn.commit()
     return conn
 
@@ -658,47 +710,170 @@ def cache_set(conn, key, payload):
     conn.commit()
 
 
-def save_client_intraday(conn, live, captured_at=None):
-    """Persist one cumulative client-type snapshot for later intraday analysis."""
-    current = live.get("current") or {}
+def received_clock():
+    """Actual endpoint receipt time, rather than the start of a multi-symbol cycle."""
+    return tehran_now().strftime("%H:%M:%S.%f")
+
+
+def symbol_tag(symbol):
+    return "#" + str(symbol or "?").lstrip("#").replace(" ", "_")
+
+
+def client_snapshot(live, captured_at=None):
+    """Validate both complete ClientType sides; missing packets are never zero trades."""
     client = live.get("client") or {}
+    current = live.get("current") or {}
+    result = {
+        "captured_at": live.get("client_received_at") or captured_at or received_clock(),
+        "last_price": to_float(current.get("pDrCotVal"), 0),
+        "volume": to_float(current.get("qTotTran5J"), 0),  # official diagnostic only
+        "ready": False, "status": "MISSING",
+    }
+    for field, keys in CLIENT_FIELDS.items():
+        value = next((client[k] for k in keys if client.get(k) not in (None, "")), None)
+        result[field] = to_float(value, float("nan")) if value is not None else None
+    if not all(v is not None and math.isfinite(v) and v >= 0 and v == int(v)
+               for v in (result[k] for k in CLIENT_FIELDS)):
+        return result
+    # Unknown participant categories cannot silently disappear from total volume.
+    other = [to_float(v, float("nan")) for k, v in client.items()
+             if k.endswith("_Volume") and k not in
+             ("buy_I_Volume", "sell_I_Volume", "buy_N_Volume", "sell_N_Volume")]
+    if any(not math.isfinite(v) or v != 0 for v in other):
+        result["status"] = "OTHER_CATEGORY"
+        return result
+    buy = result["real_buy_volume"] + result["legal_buy_volume"]
+    sell = result["real_sell_volume"] + result["legal_sell_volume"]
+    if buy != sell:
+        result["status"] = "SIDE_MISMATCH"
+        return result
+    for group in ("real", "legal"):
+        for side in ("buy", "sell"):
+            if result[f"{group}_{side}_volume"] > 0 and result[f"{group}_{side}_count"] <= 0:
+                result["status"] = "COUNT_MISSING"
+                return result
+    result.update(classified_volume=buy, ready=buy > 0, status="READY" if buy > 0 else "EMPTY")
+    return result
+
+
+def client_interval(now, previous):
+    """Only matched, monotonic client counters in the same correction epoch."""
+    if not now or not previous or not now.get("ready") or not previous.get("ready"):
+        return None
+    if now.get("epoch", 0) != previous.get("epoch", 0):
+        return None
+    values = {key: now[key] - previous[key] for key in CLIENT_FIELDS}
+    if any(v < 0 for v in values.values()):
+        return None
+    values["classified_volume"] = now["classified_volume"] - previous["classified_volume"]
+    return values if values["classified_volume"] >= 0 else None
+
+
+def save_alert_sample(conn, symbol, day, kind, sample):
+    conn.execute("""INSERT OR REPLACE INTO alert_samples
+                    (symbol,date,kind,captured_at,payload) VALUES(?,?,?,?,?)""",
+                 (symbol, day, kind, sample["captured_at"],
+                  json.dumps(sample, ensure_ascii=False, allow_nan=False)))
+    conn.commit()
+
+
+def alert_sample(conn, symbol, day, kind, before=None, lower=None, upper=None, oldest=False):
+    sql = "SELECT payload FROM alert_samples WHERE symbol=? AND date=? AND kind=?"
+    args = [symbol, day, kind]
+    for operator, value in (("<", before), (">=", lower), ("<=", upper)):
+        if value is not None:
+            sql += f" AND captured_at{operator}?"
+            args.append(value)
+    sql += " ORDER BY captured_at " + ("ASC" if oldest else "DESC") + " LIMIT 1"
+    row = conn.execute(sql, args).fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def accept_client_snapshot(conn, live, captured_at):
+    """Fast alone advances alert baselines. Reject old totals without lowering the baseline."""
+    symbol = live.get("symbol") or "?"
+    day = to_int((live.get("current") or {}).get("dEven"), 0)
+    sample = client_snapshot(live, captured_at)
+    previous = alert_sample(conn, symbol, day, "client")
+    live["_flow_reference"] = previous
+    live["_client_sample"] = None
+    live["_client_status"] = sample["status"]
+    if not sample["ready"]:
+        return None
+    if previous:
+        if sample["captured_at"] <= previous["captured_at"] or sample["classified_volume"] < previous["classified_volume"]:
+            live["_client_status"] = "ROLLBACK"
+            return None
+        # A redistribution/count correction is a new baseline, never a trade.
+        correction = any(sample[k] < previous[k] for k in CLIENT_FIELDS)
+        sample["epoch"] = previous.get("epoch", 0) + int(correction)
+        if correction:
+            live["_client_status"] = "REBASED"
+    else:
+        sample["epoch"] = 0
+    live["_client_sample"] = sample
+    save_alert_sample(conn, symbol, day, "client", sample)
+    return sample
+
+
+def published_client_snapshot(conn, live):
+    """Coherent daily data; fall back to the accepted Fast reading on stale Heavy packets."""
+    if not current_has_trades(live.get("current") or {}):
+        return None
+    if "_client_sample" in live:
+        return live["_client_sample"]
+    sample = client_snapshot(live)
+    day = to_int((live.get("current") or {}).get("dEven"), 0)
+    accepted = alert_sample(conn, live.get("symbol") or "?", day, "client")
+    if accepted and (not sample["ready"] or sample["classified_volume"] < accepted["classified_volume"]
+                     or sample["captured_at"] < accepted["captured_at"]):
+        return accepted
+    return sample if sample["ready"] else None
+
+
+def previous_volume_average(conn, symbol, day, sessions=20):
+    rows = [r for r in get_daily_rows(conn, symbol)
+            if to_int(r.get("date"), 0) < day and to_float(r.get("volume"), 0) > 0][-sessions:]
+    return (sum(to_float(r["volume"], 0) for r in rows)/len(rows), len(rows)) if rows else (None, 0)
+
+
+def save_client_intraday(conn, live, captured_at=None):
+    """Archive raw endpoint data, including its quality and origin; not an alert baseline."""
+    current = live.get("current") or {}
     symbol = live.get("symbol") or ""
-    date_value = to_int(current.get("dEven"), 0)
-    if not symbol or not date_value:
+    day = to_int(current.get("dEven"), 0)
+    if not symbol or not day:
         return
-
-    captured_at = captured_at or datetime.now(TEHRAN_TZ).strftime("%H:%M:%S")
-    market_time = format_time(current.get("hEven") or current.get("lastHEven"))
-
-    rbv = client_metric(client, "buy_I_Volume")
-    rsv = client_metric(client, "sell_I_Volume")
-    lbv = client_metric(client, "buy_N_Volume")
-    lsv = client_metric(client, "sell_N_Volume")
-    rbc = client_metric(client, "buy_I_Count", "buy_CountI")
-    rsc = client_metric(client, "sell_I_Count", "sell_CountI")
-    lbc = client_metric(client, "buy_N_Count", "buy_CountN")
-    lsc = client_metric(client, "sell_N_Count", "sell_CountN")
-
+    sample = client_snapshot(live, captured_at)
+    def clean(value):
+        return value if value is None or math.isfinite(value) else None
+    fields = {key: clean(sample[key]) for key in CLIENT_FIELDS}
+    rbv, rsv = fields["real_buy_volume"], fields["real_sell_volume"]
+    lbv, lsv = fields["legal_buy_volume"], fields["legal_sell_volume"]
+    rbc, rsc = fields["real_buy_count"], fields["real_sell_count"]
     avg_buy = safe_div(rbv, rbc)
     avg_sell = safe_div(rsv, rsc)
-    bp = safe_div(avg_buy, avg_sell) if avg_buy is not None and avg_sell is not None else None
-
-    conn.execute("""
-        INSERT OR REPLACE INTO client_intraday(
-            symbol,date,captured_at,market_time,last_price,closing_price,volume,
-            real_buy_count,real_sell_count,legal_buy_count,legal_sell_count,
-            real_buy_volume,real_sell_volume,legal_buy_volume,legal_sell_volume,
-            avg_real_buy_volume,avg_real_sell_volume,buyer_power,
-            real_net_volume,legal_net_volume
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        symbol, date_value, captured_at, market_time,
-        to_float(current.get("pDrCotVal"), 0),
-        to_float(current.get("pClosing"), 0),
-        to_float(current.get("qTotTran5J"), 0),
-        rbc, rsc, lbc, lsc, rbv, rsv, lbv, lsv,
-        avg_buy, avg_sell, bp, rbv-rsv, lbv-lsv,
-    ))
+    ready = sample["ready"]
+    bp = real_buyer_power(rbv, rsv, rbc, rsc) if ready else None
+    record = dict(
+        symbol=symbol, date=day, captured_at=sample["captured_at"],
+        market_time=format_time(current.get("hEven") or current.get("lastHEven")),
+        last_price=to_float(current.get("pDrCotVal"), 0),
+        closing_price=to_float(current.get("pClosing"), 0),
+        volume=to_float(current.get("qTotTran5J"), 0),
+        **fields, avg_real_buy_volume=avg_buy if ready else None,
+        avg_real_sell_volume=avg_sell if ready else None, buyer_power=bp,
+        real_net_volume=rbv-rsv if ready else None,
+        legal_net_volume=lbv-lsv if ready else None,
+        capture_source=live.get("capture_source", "manual"),
+        price_received_at=live.get("price_received_at"),
+        client_received_at=sample["captured_at"],
+        classified_volume=sample.get("classified_volume") if sample["status"] in ("READY", "EMPTY") else None,
+        client_status=live.get("_client_status", sample["status"]),
+    )
+    columns = ",".join(record)
+    conn.execute(f"INSERT OR REPLACE INTO client_intraday ({columns}) VALUES ({','.join('?' for _ in record)})",
+                 list(record.values()))
     conn.commit()
 
 
@@ -724,7 +899,7 @@ def save_best_limits_intraday(conn, live, captured_at=None):
     if not symbol or not date_value:
         return
 
-    captured_at = captured_at or tehran_now().strftime("%H:%M:%S")
+    captured_at = live.get("book_received_at") or captured_at or received_clock()
     rows = live.get("best") or []
     for i, r in enumerate(rows, 1):
         if not isinstance(r, dict):
@@ -734,8 +909,8 @@ def save_best_limits_intraday(conn, live, captured_at=None):
             INSERT OR REPLACE INTO best_limits_intraday(
                 symbol,date,captured_at,level_no,
                 buy_price,buy_volume,buy_count,
-                sell_price,sell_volume,sell_count
-            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                sell_price,sell_volume,sell_count,capture_source
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
         """, (
             symbol, date_value, captured_at, level_no,
             to_float(r.get("pMeDem"), 0),
@@ -744,6 +919,7 @@ def save_best_limits_intraday(conn, live, captured_at=None):
             to_float(r.get("pMeOf"), 0),
             to_float(r.get("qTitMeOf"), 0),
             to_float(r.get("zOrdMeOf"), 0),
+            live.get("capture_source", "manual"),
         ))
     conn.commit()
 
@@ -764,19 +940,14 @@ def get_best_limits_intraday_rows(conn, date_value=None):
 
 
 def previous_client_snapshot(conn, symbol, date_value, captured_at):
-    row = conn.execute("""
-        SELECT * FROM client_intraday
-        WHERE symbol=? AND date=? AND captured_at<?
-        ORDER BY captured_at DESC LIMIT 1
-    """, (symbol, date_value, captured_at)).fetchone()
-    return dict(row) if row else None
+    return alert_sample(conn, symbol, date_value, "client", before=captured_at)
 
 
 def _hms_to_seconds(value):
     try:
-        hh, mm, ss = [int(x) for x in str(value).split(":")[:3]]
-        return hh * 3600 + mm * 60 + ss
-    except Exception:
+        hh, mm, ss = str(value).split(":")[:3]
+        return int(hh)*3600 + int(mm)*60 + float(ss)
+    except (ValueError, TypeError):
         return None
 
 
@@ -787,75 +958,45 @@ def _seconds_to_hms(value):
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 
-def momentum_reference_snapshot(conn, symbol, date_value, captured_at):
-    """Return an intraday snapshot roughly 3-5 minutes before captured_at.
-
-    We deliberately use a wider lookback window instead of an exact timestamp,
-    because GitHub/HTTP timing can make nominal 30-second snapshots arrive a few
-    seconds late. The oldest available row in the window gives the broadest
-    3-5 minute cumulative move and volume.
-    """
-    cur_sec = _hms_to_seconds(captured_at)
-    if cur_sec is None or cur_sec < MOMENTUM_MIN_SECONDS:
+def momentum_reference_snapshot(conn, symbol, date_value, captured_at, kind="client"):
+    """Fast-only references; Heavy timestamps never enter alert windows."""
+    seconds = _hms_to_seconds(captured_at)
+    if seconds is None:
         return None
-
-    lower_sec = max(0, cur_sec - MOMENTUM_MAX_SECONDS)
-    upper_sec = max(0, cur_sec - MOMENTUM_MIN_SECONDS)
-    lower_hms = _seconds_to_hms(lower_sec)
-    upper_hms = _seconds_to_hms(upper_sec)
-
-    row = conn.execute("""
-        SELECT * FROM client_intraday
-        WHERE symbol=? AND date=?
-          AND captured_at>=? AND captured_at<=?
-        ORDER BY captured_at ASC
-        LIMIT 1
-    """, (symbol, date_value, lower_hms, upper_hms)).fetchone()
-    return dict(row) if row else None
+    return alert_sample(conn, symbol, date_value, kind,
+                        lower=_seconds_to_hms(seconds-MOMENTUM_MAX_SECONDS),
+                        upper=_seconds_to_hms(seconds-MOMENTUM_MIN_SECONDS), oldest=True)
 
 
 def latest_30s_delta(conn, symbol, date_value):
-    rows = conn.execute("""
-        SELECT * FROM client_intraday
-        WHERE symbol=? AND date=?
-        ORDER BY captured_at DESC
-        LIMIT 2
-    """, (symbol, date_value)).fetchall()
+    rows = conn.execute("""SELECT payload FROM alert_samples
+        WHERE symbol=? AND date=? AND kind='client'
+        ORDER BY captured_at DESC LIMIT 2""", (symbol, date_value)).fetchall()
     if len(rows) < 2:
         return None
-    cur = dict(rows[0])
-    prev = dict(rows[1])
-
-    d_buy_v = max(0.0, to_float(cur.get("real_buy_volume"), 0) - to_float(prev.get("real_buy_volume"), 0))
-    d_sell_v = max(0.0, to_float(cur.get("real_sell_volume"), 0) - to_float(prev.get("real_sell_volume"), 0))
-    d_buy_c = max(0, to_int(cur.get("real_buy_count"), 0) - to_int(prev.get("real_buy_count"), 0))
-    d_sell_c = max(0, to_int(cur.get("real_sell_count"), 0) - to_int(prev.get("real_sell_count"), 0))
-
-    return {
-        "captured_at": cur.get("captured_at"),
-        "d_buy_v": d_buy_v,
-        "d_sell_v": d_sell_v,
-        "d_buy_c": d_buy_c,
-        "d_sell_c": d_sell_c,
-        "net": d_buy_v - d_sell_v,
-    }
+    cur, prev = [json.loads(row["payload"]) for row in rows]
+    change = client_interval(cur, prev)
+    if change is None:
+        return None
+    return {"captured_at": cur["captured_at"],
+            "d_buy_v": change["real_buy_volume"], "d_sell_v": change["real_sell_volume"],
+            "d_buy_c": change["real_buy_count"], "d_sell_c": change["real_sell_count"],
+            "net": change["real_buy_volume"]-change["real_sell_volume"]}
 
 
 def previous_book_snapshot(conn, symbol, date_value, captured_at):
     row = conn.execute("""
         SELECT captured_at FROM best_limits_intraday
-        WHERE symbol=? AND date=? AND captured_at<?
+        WHERE symbol=? AND date=? AND captured_at<? AND capture_source='fast'
         ORDER BY captured_at DESC LIMIT 1
     """, (symbol, date_value, captured_at)).fetchone()
     if not row:
         return []
-    ts = row["captured_at"]
-    rows = conn.execute("""
+    return [dict(r) for r in conn.execute("""
         SELECT * FROM best_limits_intraday
-        WHERE symbol=? AND date=? AND captured_at=?
+        WHERE symbol=? AND date=? AND captured_at=? AND capture_source='fast'
         ORDER BY level_no
-    """, (symbol, date_value, ts)).fetchall()
-    return [dict(r) for r in rows]
+    """, (symbol, date_value, row["captured_at"]))]
 
 
 def queue_reference_snapshot(conn, symbol, date_value, captured_at):
@@ -868,7 +1009,7 @@ def queue_reference_snapshot(conn, symbol, date_value, captured_at):
     upper_hms = _seconds_to_hms(max(0, cur_sec - QUEUE_CHANGE_MIN_SECONDS))
     row = conn.execute("""
         SELECT captured_at FROM best_limits_intraday
-        WHERE symbol=? AND date=?
+        WHERE symbol=? AND date=? AND capture_source='fast'
           AND captured_at>=? AND captured_at<=?
         ORDER BY captured_at ASC
         LIMIT 1
@@ -878,7 +1019,7 @@ def queue_reference_snapshot(conn, symbol, date_value, captured_at):
     ts = row["captured_at"]
     rows = conn.execute("""
         SELECT * FROM best_limits_intraday
-        WHERE symbol=? AND date=? AND captured_at=?
+        WHERE symbol=? AND date=? AND capture_source='fast' AND captured_at=?
         ORDER BY level_no
     """, (symbol, date_value, ts)).fetchall()
     return [dict(r) for r in rows]
@@ -995,133 +1136,95 @@ def alert_money(value):
     return alert_ltr(f"{value:,.0f}") + " تومان"
 
 
-def format_estimated_side_average(side, volume, new_people, price):
-    """Estimate per-new-participant flow; keep totals if there are no new people."""
-    if new_people > 0:
-        volume = volume / new_people
-        label = f"سرانه تخمینی {side} ({alert_ltr(f'{new_people:,.0f}')} نفر جدید)"
-    else:
-        label = f"{side} حقیقی"
-    line = f"{label}: {alert_shares(volume)}"
+def format_estimated_side_average(side, volume, new_people, price, group="حقیقی"):
+    """Show total and estimated per-new-person flow together, for either group."""
+    line = f"{side} {group}: {alert_shares(volume)}"
     if price > 0:
         line += " ≈ " + alert_money(estimate_trade_value_toman(volume, price))
+    if new_people > 0:
+        average = volume/new_people
+        line += f"\nسرانه تخمینی ({alert_ltr(f'{new_people:,.0f}')} نفر جدید): {alert_shares(average)}"
+        if price > 0:
+            line += " ≈ " + alert_money(estimate_trade_value_toman(average, price))
+    else:
+        person = "خریدار" if side == "خرید" else "فروشنده"
+        line += f"\n{person} جدید اضافه نشد"
     return line
 
 
 def format_market_alert(title, symbol, captured_at, sections, minutes=None):
-    time_line = "🕒 " + alert_ltr(captured_at)
+    time_line = "🕒 " + alert_ltr(str(captured_at).split(".")[0])
     if minutes is not None:
         if minutes < 1:
             time_line += " · " + alert_ltr(f"{minutes*60:.0f}") + " ثانیه"
         else:
             time_line += " · " + alert_ltr(f"{minutes:.1f}") + " دقیقه"
-    header = f"{title} — {symbol}\n{time_line}"
+    header = f"{title} — {symbol_tag(symbol)}\n{time_line}"
     return "\n\n".join([header] + [s.strip() for s in sections if s and s.strip()])
 
 
-def format_trade_window_alert(conn, live, reference, captured_at, title, extra=""):
-    """Compact RTL layout; retain version 9 estimated BP based on count deltas.
-
-    Price/value approximations and estimated interval BP are labelled. Total
-    turnover uses market volume once, never the sum of both sides' volumes.
-    """
+def format_trade_window_alert(conn, live, reference, captured_at, title, extra="", flow_reference=None):
+    """Price window and received ClientType updates are deliberately labelled separately."""
     current = live.get("current") or {}
-    client = live.get("client") or {}
     reference = reference or {}
+    sample = published_client_snapshot(conn, live)
+    flow_reference = flow_reference if flow_reference is not None else reference
+    change = client_interval(sample, flow_reference)
     price = to_float(current.get("pDrCotVal"), 0)
     old_price = to_float(reference.get("last_price"), 0)
     yesterday = to_float(current.get("priceYesterday"), 0)
-    cur_sec = _hms_to_seconds(captured_at)
-    ref_sec = _hms_to_seconds(reference.get("captured_at"))
+    price_at = live.get("price_received_at") or captured_at
+    cur_sec, ref_sec = _hms_to_seconds(price_at), _hms_to_seconds(reference.get("captured_at"))
     minutes = (cur_sec-ref_sec)/60 if cur_sec is not None and ref_sec is not None and cur_sec >= ref_sec else None
     current_display = fmt_price_pct(price, yesterday)
-    price_display = alert_rtl_change(fmt_price_pct(old_price, yesterday), current_display) if old_price > 0 else alert_ltr(current_display)
-    price_lines = [f"قیمت: {price_display}"]
-
-    day_volume = to_float(current.get("qTotTran5J"), 0)
-    total_delta = day_volume - to_float(reference.get("volume"), 0)
-    benchmark = []
-    if total_delta >= 0:
-        total_line = f"کل بازه: {alert_shares(total_delta)}"
-        if price > 0:
-            total_line += " ≈ " + alert_money(estimate_trade_value_toman(total_delta, price))
-        price_lines.append(total_line)
-    else:
-        price_lines.append("کل بازه: نامشخص؛ اصلاح آمار")
-
-    if total_delta >= 0 and day_volume > 0:
-        window_share = alert_ltr(f"{100*total_delta/day_volume:.2f}%")
-        benchmark.append(f"سهم بازه از حجم امروز: {window_share}")
-    else:
-        benchmark.append("سهم بازه از حجم امروز: نامشخص")
-    if day_volume >= 0:
-        today_line = "حجم امروز: " + alert_shares(day_volume)
-        rows = get_daily_rows(conn, live.get("symbol") or "?")
-        date_value = to_int(current.get("dEven"), 0)
-        days = [r for r in rows if to_int(r.get("date"), 0) < date_value and to_float(r.get("volume"), 0) > 0][-20:]
-        if days:
-            average = sum(to_float(r.get("volume"), 0) for r in days) / len(days)
-            day_ratio = alert_ltr(f"{day_volume/average:.2f}")
-            sessions = str(len(days)).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
-            today_line += f"؛ {day_ratio} برابر میانگین{sessions}روزه"
-        else:
-            today_line += "؛ نسبت به میانگین۲۰روزه نامشخص"
-        benchmark.append(today_line)
-
-    fields = (
-        ("real_buy_volume", ("buy_I_Volume",)), ("real_sell_volume", ("sell_I_Volume",)),
-        ("real_buy_count", ("buy_I_Count", "buy_CountI")),
-        ("real_sell_count", ("sell_I_Count", "sell_CountI")),
-    )
-    totals = [client_metric(client, *keys) for _, keys in fields]
-    old_totals = [to_float(reference.get(field), -1) for field, _ in fields]
-    valid = all(math.isfinite(new) and math.isfinite(old) and new >= old >= 0
-                for new, old in zip(totals, old_totals))
-    real_lines = []
-    ratio_lines = []
-    if valid:
-        buy, sell, buyers, sellers = [new-old for new, old in zip(totals, old_totals)]
-        real_lines.append(format_estimated_side_average("خرید", buy, buyers, price))
-        real_lines.append(format_estimated_side_average("فروش", sell, sellers, price))
-        net = buy - sell
-        if net != 0:
-            label = "خالص ورود" if net > 0 else "خالص خروج"
-            net_line = f"{label}: {alert_shares(abs(net))}"
-            if price > 0:
-                net_line += " ≈ " + alert_money(estimate_trade_value_toman(abs(net), price))
-            real_lines.append(net_line)
-        ratio_lines.append(format_interval_buyer_power(buy, sell, buyers, sellers))
-    else:
-        real_lines.append("حقیقی بازه: داده ناقص یا اصلاح‌شده")
-    ratio_lines.append(format_real_buyer_power(*totals, reference))
-    ratio_lines.extend(benchmark)
-
-    legal_deltas = []
-    for field, keys in (
-        ("legal_buy_volume", ("buy_N_Volume",)), ("legal_sell_volume", ("sell_N_Volume",)),
-        ("legal_buy_count", ("buy_N_Count", "buy_CountN")),
-        ("legal_sell_count", ("sell_N_Count", "sell_CountN")),
-    ):
-        legal_deltas.append(max(0, client_metric(client, *keys) - to_float(reference.get(field), 0)))
-    legal_section = format_legal_flow(*legal_deltas[:2], price, *legal_deltas[2:])
-    return format_market_alert(title, live.get("symbol") or "?", captured_at, [
-        "\n".join(price_lines), "\n".join(real_lines),
-        "\n".join(ratio_lines), legal_section, extra,
-    ], minutes=minutes)
+    display = alert_rtl_change(fmt_price_pct(old_price, yesterday), current_display) if old_price > 0 else alert_ltr(current_display)
+    sections = [f"قیمت: {display}"]
+    if change and change["classified_volume"] > 0:
+        total = change["classified_volume"]
+        clock = alert_rtl_change(str(flow_reference["captured_at"]).split(".")[0],
+                                 str(sample["captured_at"]).split(".")[0])
+        sections.append(f"به‌روزرسانی تفکیک: {clock}\n"
+                        f"حجم افزوده: {alert_shares(total)} ≈ {alert_money(estimate_trade_value_toman(total, price))}")
+        real_lines = [format_estimated_side_average(side, change[f"real_{key}_volume"],
+                       change[f"real_{key}_count"], price)
+                      for side, key in (("خرید", "buy"), ("فروش", "sell"))]
+        sections.append("\n\n".join(real_lines))
+        legal = format_legal_flow(change["legal_buy_volume"], change["legal_sell_volume"],
+                                  price, change["legal_buy_count"], change["legal_sell_count"])
+        if legal:
+            sections.append(legal)
+        net = change["real_buy_volume"]-change["real_sell_volume"]
+        if net:
+            label = "خالص ورود حقیقی" if net > 0 else "خالص خروج حقیقی"
+            sections.append(f"{label}: {alert_shares(abs(net))} ≈ {alert_money(estimate_trade_value_toman(abs(net), price))}")
+        sections.append(format_interval_buyer_power(change["real_buy_volume"], change["real_sell_volume"],
+                                                    change["real_buy_count"], change["real_sell_count"]))
+    if sample:
+        daily = [format_real_buyer_power(sample["real_buy_volume"], sample["real_sell_volume"],
+                                        sample["real_buy_count"], sample["real_sell_count"],
+                                        flow_reference)]
+        day_volume = sample["classified_volume"]
+        if change and change["classified_volume"] > 0:
+            daily.append("سهم افزایش از حجم امروز: " + alert_ltr(f'{100*change["classified_volume"]/day_volume:.2f}%'))
+        line = "حجم تفکیکی امروز: " + alert_shares(day_volume)
+        average, sessions = previous_volume_average(conn, live.get("symbol") or "?",
+                                                     to_int(current.get("dEven"), 0))
+        if average:
+            digits = str(sessions).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+            line += f"؛ {alert_ltr(f'{day_volume/average:.2f}')} برابر میانگین{digits}روزه"
+        daily.append(line)
+        sections.append("\n".join(daily))
+    if extra:
+        sections.append(extra)
+    return format_market_alert(title, live.get("symbol") or "?", price_at, sections, minutes=minutes)
 
 
 def format_legal_flow(buy_v, sell_v, price_rial, buy_count_delta=0, sell_count_delta=0, label="حقوقی"):
-    buy_v, sell_v = max(0, to_float(buy_v, 0)), max(0, to_float(sell_v, 0))
-    lines = []
-    for side, volume in (("خرید حقوقی", buy_v), ("فروش حقوقی", sell_v)):
-        if volume > 0:
-            line = f"{side}: {alert_shares(volume)}"
-            if price_rial > 0:
-                line += " ≈ " + alert_money(estimate_trade_value_toman(volume, price_rial))
-            lines.append(line)
-    if not lines and (buy_count_delta > 0 or sell_count_delta > 0):
-        lines.append(f"تعداد جدید حقوقی: خرید {alert_ltr(to_int(buy_count_delta, 0))}، فروش {alert_ltr(to_int(sell_count_delta, 0))}")
-    return "\n".join(lines)
+    if not (buy_v or sell_v or buy_count_delta or sell_count_delta):
+        return ""
+    return "\n\n".join(format_estimated_side_average(side, volume, count, price_rial, label)
+                          for side, volume, count in (("خرید", buy_v, buy_count_delta),
+                                                       ("فروش", sell_v, sell_count_delta)))
 
 
 def format_book_alert(title, symbol, captured_at, yesterday, label="صف",
@@ -1177,16 +1280,11 @@ def pct_emoji(x):
 
 
 
-def alert_threshold_shares(conn, symbol, fraction=None):
+def alert_threshold_shares(conn, symbol, fraction=None, date_value=None):
     fraction = ALERT_DAILY_VOLUME_FRACTION if fraction is None else fraction
-    rows = get_daily_rows(conn, symbol)
-    if not rows:
-        return float(ALERT_MIN_SHARES)
-    latest_date = max((to_int(r.get("date"), 0) for r in rows), default=0)
-    prev = [r for r in rows if to_int(r.get("date"), 0) < latest_date and to_float(r.get("volume"), 0) > 0]
-    prev20 = prev[-20:]
-    avg20 = sum(to_float(r.get("volume"), 0) for r in prev20) / len(prev20) if prev20 else 0
-    return max(float(ALERT_MIN_SHARES), avg20 * fraction)
+    day = date_value or int(tehran_now().strftime("%Y%m%d"))
+    average, _ = previous_volume_average(conn, symbol, day)
+    return max(float(ALERT_MIN_SHARES), (average or 0)*fraction)
 
 
 def alert_allowed(conn, key, cooldown_seconds=None):
@@ -1199,218 +1297,184 @@ def alert_allowed(conn, key, cooldown_seconds=None):
     return True
 
 
+def current_has_trades(current):
+    market_time = to_int(current.get("hEven") or current.get("lastHEven"), 0)
+    return (to_float(current.get("qTotTran5J"), 0) > 0
+            and to_float(current.get("pDrCotVal"), 0) > 0 and market_time >= 90000)
+
+
 def detect_fast_alerts(conn, live, captured_at):
-    """Detect heavy real-person flow and likely order deletion/movement."""
+    """Independent price, classified-flow and book signals with separate Fast baselines."""
     alerts = []
     current = live.get("current") or {}
-    client = live.get("client") or {}
     symbol = live.get("symbol") or "?"
     date_value = to_int(current.get("dEven"), 0)
-    if not date_value:
+    if date_value != int(tehran_now().strftime("%Y%m%d")):
         return alerts
+    price_at = live.get("price_received_at") or captured_at
+    client_at = live.get("client_received_at") or captured_at
+    book_at = live.get("book_received_at") or captured_at
     price_yesterday = to_float(current.get("priceYesterday"), 0)
+    last_price = to_float(current.get("pDrCotVal"), 0)
+    official_volume = to_float(current.get("qTotTran5J"), 0)
+    previous_price = alert_sample(conn, symbol, date_value, "price")
+    prev = alert_sample(conn, symbol, date_value, "observation")
+    official_delta = official_volume-prev["volume"] if prev else None
+    market_time = to_int(current.get("hEven") or current.get("lastHEven"), 0)
+    if prev and (official_delta < 0 or market_time < prev.get("market_time", 0)):
+        official_delta = None
 
-    prev = previous_client_snapshot(conn, symbol, date_value, captured_at)
-    if prev:
-        rbv = client_metric(client, "buy_I_Volume")
-        rsv = client_metric(client, "sell_I_Volume")
-        rbc = client_metric(client, "buy_I_Count", "buy_CountI")
-        rsc = client_metric(client, "sell_I_Count", "sell_CountI")
-        lbv = client_metric(client, "buy_N_Volume")
-        lsv = client_metric(client, "sell_N_Volume")
-        lbc = client_metric(client, "buy_N_Count", "buy_CountN")
-        lsc = client_metric(client, "sell_N_Count", "sell_CountN")
+    sample = accept_client_snapshot(conn, live, client_at) if current_has_trades(current) else None
+    if not current_has_trades(current):
+        live["_client_sample"] = None
+        live["_client_status"] = "BEFORE_TRADE"
+        live["_flow_reference"] = None
+    flow_ref = live.get("_flow_reference")
+    change = client_interval(sample, flow_ref)
+    threshold = alert_threshold_shares(conn, symbol, date_value=date_value)
+    if change:
+        heavy_buy = (change["real_buy_volume"] >= threshold
+                     and change["real_buy_count"] <= CONCENTRATED_MAX_NEW_PEOPLE)
+        heavy_sell = (change["real_sell_volume"] >= threshold
+                      and change["real_sell_count"] <= CONCENTRATED_MAX_NEW_PEOPLE)
+        if (heavy_buy or heavy_sell) and alert_allowed(conn, f"{symbol}:realflow"):
+            alerts.append(format_trade_window_alert(conn, live, flow_ref, client_at,
+                                                    "🚨 معاملات سنگین حقیقی"))
+        legal_net = change["legal_buy_volume"]-change["legal_sell_volume"]
+        legal_threshold = alert_threshold_shares(conn, symbol, LEGAL_FLOW_DAILY_VOLUME_FRACTION, date_value)
+        if abs(legal_net) >= legal_threshold:
+            side = "buy" if legal_net > 0 else "sell"
+            if alert_allowed(conn, f"{symbol}:legalflow:{side}", LEGAL_FLOW_COOLDOWN_SECONDS):
+                title = "🏢 خرید خالص سنگین حقوقی" if legal_net > 0 else "🏢 فروش خالص سنگین حقوقی"
+                alerts.append(format_trade_window_alert(conn, live, flow_ref, client_at, title))
 
-        d_buy_v = max(0.0, rbv - to_float(prev.get("real_buy_volume"), 0))
-        d_sell_v = max(0.0, rsv - to_float(prev.get("real_sell_volume"), 0))
-        d_buy_c = max(0, to_int(rbc, 0) - to_int(prev.get("real_buy_count"), 0))
-        d_sell_c = max(0, to_int(rsc, 0) - to_int(prev.get("real_sell_count"), 0))
-        d_legal_buy_v = max(0.0, lbv - to_float(prev.get("legal_buy_volume"), 0))
-        d_legal_sell_v = max(0.0, lsv - to_float(prev.get("legal_sell_volume"), 0))
-        d_legal_buy_c = max(0, to_int(lbc, 0) - to_int(prev.get("legal_buy_count"), 0))
-        d_legal_sell_c = max(0, to_int(lsc, 0) - to_int(prev.get("legal_sell_count"), 0))
-        th = alert_threshold_shares(conn, symbol)
+        # No price-change or participant-count gate for the independent volume signal.
+        # The reported boundary prevents overlapping rolling windows reporting old volume.
+        sample_threshold = alert_threshold_shares(conn, symbol, VOLUME_BURST_SAMPLE_FRACTION, date_value)
+        window_threshold = alert_threshold_shares(conn, symbol, VOLUME_BURST_WINDOW_FRACTION, date_value)
+        seconds = _hms_to_seconds(client_at)
+        window_ref = alert_sample(conn, symbol, date_value, "client",
+                                  lower=_seconds_to_hms(seconds-VOLUME_BURST_WINDOW_SECONDS),
+                                  before=client_at, oldest=True)
+        boundary_key = f"volume_burst_boundary:{date_value}:{symbol}"
+        try:
+            boundary = json.loads(meta_get(conn, boundary_key, "null"))
+        except (ValueError, TypeError):
+            boundary = None
+        if boundary and window_ref and boundary["captured_at"] > window_ref["captured_at"]:
+            window_ref = boundary
+        window_change = client_interval(sample, window_ref)
+        fresh_ref = window_ref if boundary and window_ref else flow_ref
+        if client_interval(sample, fresh_ref) is None:
+            fresh_ref = flow_ref
+        burst_ref = fresh_ref if change["classified_volume"] >= sample_threshold else None
+        if burst_ref is None and window_change and window_change["classified_volume"] >= window_threshold:
+            burst_ref = window_ref
+        pending_key = f"volume_burst_pending:{date_value}:{symbol}"
+        try:
+            pending_ref = json.loads(meta_get(conn, pending_key, "null"))
+        except (ValueError, TypeError):
+            pending_ref = None
+        if pending_ref and client_interval(sample, pending_ref) is None:
+            pending_ref = None
+            meta_set(conn, pending_key, "null")
+        if burst_ref:
+            if pending_ref is None or burst_ref["captured_at"] < pending_ref["captured_at"]:
+                pending_ref = burst_ref
+            meta_set(conn, pending_key, json.dumps(pending_ref, ensure_ascii=False))
+        if pending_ref and alert_allowed(conn, f"{symbol}:volume_burst", VOLUME_BURST_COOLDOWN_SECONDS):
+            alerts.append(format_trade_window_alert(conn, live, pending_ref, client_at,
+                                                    "📊 افزایش سنگین حجم تفکیکی"))
+            meta_set(conn, boundary_key, json.dumps(sample, ensure_ascii=False))
+            meta_set(conn, pending_key, "null")
 
-        last_price = to_float(current.get("pDrCotVal"), 0)
-        py = to_float(current.get("priceYesterday"), 0)
-        last_pct = pct_change(last_price, py)
-        legal_line_30s = format_legal_flow(
-            d_legal_buy_v, d_legal_sell_v, last_price, d_legal_buy_c, d_legal_sell_c
-        )
+        average, _ = previous_volume_average(conn, symbol, date_value)
+        if average and flow_ref["classified_volume"]/average < VOLUME_RATIO_ALERT <= sample["classified_volume"]/average:
+            if alert_allowed(conn, f"{symbol}:volumeratio"):
+                alerts.append(format_trade_window_alert(conn, live, flow_ref, client_at, "🔥 حجم غیرعادی"))
 
-        # Preserve the existing volume/count trigger, but report both sides once.
-        # Cumulative count changes cannot establish who traded the interval volume.
-        client_counters_valid = all(
-            math.isfinite(now) and now >= to_float(prev.get(field), 0)
-            for now, field in (
-                (rbv, "real_buy_volume"), (rsv, "real_sell_volume"),
-                (rbc, "real_buy_count"), (rsc, "real_sell_count"),
-            )
-        )
-        heavy_buy = d_buy_v >= th and d_buy_c <= CONCENTRATED_MAX_NEW_PEOPLE
-        heavy_sell = d_sell_v >= th and d_sell_c <= CONCENTRATED_MAX_NEW_PEOPLE
-        if client_counters_valid and (heavy_buy or heavy_sell) and alert_allowed(conn, f"{symbol}:realflow"):
-            alerts.append(format_trade_window_alert(
-                conn, live, prev, captured_at, "🚨 معاملات سنگین حقیقی"
-            ))
-
-        # Dedicated legal/institutional net-flow alert.  This is based only on
-        # ClientType trades, not on visible queue ownership.
-        legal_net_delta = d_legal_buy_v - d_legal_sell_v
-        legal_th = alert_threshold_shares(conn, symbol, LEGAL_FLOW_DAILY_VOLUME_FRACTION)
-        if abs(legal_net_delta) >= legal_th:
-            legal_side = "buy" if legal_net_delta > 0 else "sell"
-            if alert_allowed(conn, f"{symbol}:legalflow:{legal_side}", LEGAL_FLOW_COOLDOWN_SECONDS):
-                legal_title = "🏢 خرید خالص سنگین حقوقی" if legal_net_delta > 0 else "🏢 فروش خالص سنگین حقوقی"
-                opposite_real = d_buy_v - d_sell_v
-                opposite_value = estimate_trade_value_toman(abs(opposite_real), last_price)
-                if opposite_real > 0:
-                    real_desc = f"+{fmt_compact_num(opposite_real)} سهم ≈ {fmt_toman(opposite_value)} تومان ورود حقیقی"
-                elif opposite_real < 0:
-                    real_desc = f"-{fmt_compact_num(abs(opposite_real))} سهم ≈ {fmt_toman(opposite_value)} تومان خروج حقیقی"
-                else:
-                    real_desc = "صفر"
-                alerts.append(format_trade_window_alert(conn, live, prev, captured_at, legal_title))
-
-    # Sudden price / momentum / queue-state alerts.
-    if prev:
-        last_price = to_float(current.get("pDrCotVal"), 0)
-        prev_last = to_float(prev.get("last_price"), 0)
-        py = to_float(current.get("priceYesterday"), 0)
-        last_pct = pct_change(last_price, py)
-        prev_last_pct = pct_change(prev_last, py)
-        move_30s = pct_change(last_price, prev_last) if prev_last > 0 else 0.0
-
-        day_volume = to_float(current.get("qTotTran5J"), 0)
-        prev_day_volume = to_float(prev.get("volume"), 0)
-        traded_delta = max(0.0, day_volume - prev_day_volume)
-        move_volume_threshold = max(50_000.0, alert_threshold_shares(conn, symbol) * 0.35)
-
-        if abs(move_30s) >= SUDDEN_PRICE_PCT_30S and traded_delta >= move_volume_threshold:
-            direction = "جهش رو به بالا" if move_30s > 0 else "ریزش ناگهانی"
-            icon = "🚀" if move_30s > 0 else "🔻"
-            key = "priceup" if move_30s > 0 else "pricedown"
+    price_valid = current_has_trades(current) and price_yesterday > 0
+    if previous_price and (price_at <= previous_price["captured_at"]
+                           or official_volume < previous_price["volume"]
+                           or market_time < previous_price["market_time"]):
+        price_valid = False
+    if price_valid and not previous_price:
+        # Starting/restarting mid-session must not fabricate an opening event.
+        legacy_active = conn.execute("""SELECT 1 FROM client_intraday
+            WHERE symbol=? AND date=? AND volume>0 AND market_time>='09:00:00' LIMIT 1""",
+                                     (symbol, date_value)).fetchone()
+        opening_key = f"opening_seen:{date_value}:{symbol}"
+        witnessed_open = ((prev is not None and prev["volume"] <= 0) or
+                          (prev is None and not legacy_active and 90000 <= market_time <= 90200))
+        if witnessed_open and not meta_get(conn, opening_key):
+            opening = to_float(current.get("priceFirst"), 0) or last_price
+            opening_pct = pct_change(opening, price_yesterday)
+            direction = "مثبت" if opening_pct > 0 else "منفی" if opening_pct < 0 else "بدون تغییر"
+            lines = ["قیمت گشایش: " + alert_ltr(fmt_price_pct(opening, price_yesterday))]
+            if last_price != opening:
+                lines.append("آخرین: " + alert_ltr(fmt_price_pct(last_price, price_yesterday)))
+            alerts.append(format_market_alert(f"{pct_emoji(opening_pct)} گشایش {direction}",
+                                             symbol, price_at, ["\n".join(lines)]))
+        meta_set(conn, opening_key, "1")
+    elif price_valid and previous_price:
+        previous_last = previous_price["last_price"]
+        last_pct = pct_change(last_price, price_yesterday)
+        previous_pct = pct_change(previous_last, price_yesterday)
+        move = pct_change(last_price, previous_last)
+        # A price-only signal may precede the classified feed; omit unavailable flows.
+        volume_ok = change is None or change["classified_volume"] == 0 or change["classified_volume"] >= max(50_000, threshold*.35)
+        if abs(move) >= SUDDEN_PRICE_PCT_30S and volume_ok:
+            up = move > 0
+            key = "priceup" if up else "pricedown"
             if alert_allowed(conn, f"{symbol}:{key}"):
-                rbv_now = client_metric(client, "buy_I_Volume")
-                rsv_now = client_metric(client, "sell_I_Volume")
-                d_buy_now = max(0.0, rbv_now - to_float(prev.get("real_buy_volume"), 0))
-                d_sell_now = max(0.0, rsv_now - to_float(prev.get("real_sell_volume"), 0))
-                lbv_now = client_metric(client, "buy_N_Volume")
-                lsv_now = client_metric(client, "sell_N_Volume")
-                lbc_now = client_metric(client, "buy_N_Count", "buy_CountN")
-                lsc_now = client_metric(client, "sell_N_Count", "sell_CountN")
-                d_lbuy_now = max(0.0, lbv_now - to_float(prev.get("legal_buy_volume"), 0))
-                d_lsell_now = max(0.0, lsv_now - to_float(prev.get("legal_sell_volume"), 0))
-                d_lbuy_c_now = max(0, to_int(lbc_now, 0) - to_int(prev.get("legal_buy_count"), 0))
-                d_lsell_c_now = max(0, to_int(lsc_now, 0) - to_int(prev.get("legal_sell_count"), 0))
-                alerts.append(format_trade_window_alert(conn, live, prev, captured_at, f"{icon} {direction}"))
-
-        # Multi-minute cumulative momentum. This catches a steady "buying upward"
-        # sequence that is meaningful over 3-5 minutes but never moves >=0.60%
-        # in any single 30-second slice.
-        momentum_ref = momentum_reference_snapshot(conn, symbol, date_value, captured_at)
-        if momentum_ref:
-            ref_price = to_float(momentum_ref.get("last_price"), 0)
-            ref_volume = to_float(momentum_ref.get("volume"), 0)
-            momentum_move = pct_change(last_price, ref_price) if ref_price > 0 else 0.0
-            momentum_volume = max(0.0, day_volume - ref_volume)
-            momentum_volume_threshold = alert_threshold_shares(
-                conn, symbol, MOMENTUM_DAILY_VOLUME_FRACTION
-            )
-
-            ref_sec = _hms_to_seconds(momentum_ref.get("captured_at"))
-            cur_sec = _hms_to_seconds(captured_at)
-            window_seconds = (cur_sec - ref_sec) if cur_sec is not None and ref_sec is not None else 0
-            window_minutes = window_seconds / 60.0 if window_seconds > 0 else 0.0
-
-            if abs(momentum_move) >= MOMENTUM_PRICE_PCT and momentum_volume >= momentum_volume_threshold:
-                direction_up = momentum_move > 0
-                key = "momentumup" if direction_up else "momentumdown"
+                title = "🚀 جهش رو به بالا" if up else "🔻 ریزش ناگهانی"
+                alerts.append(format_trade_window_alert(conn, live, previous_price, price_at, title,
+                                                        flow_reference=flow_ref or {}))
+        price_ref = momentum_reference_snapshot(conn, symbol, date_value, price_at, kind="price")
+        if price_ref:
+            client_ref = momentum_reference_snapshot(conn, symbol, date_value, client_at)
+            momentum_change = client_interval(sample, client_ref)
+            volume = momentum_change["classified_volume"] if momentum_change else None
+            movement = pct_change(last_price, price_ref["last_price"])
+            ref_pct = pct_change(price_ref["last_price"], price_yesterday)
+            momentum_threshold = alert_threshold_shares(conn, symbol, MOMENTUM_DAILY_VOLUME_FRACTION, date_value)
+            # No invented volume while classification is unavailable.
+            volume_ok = volume is None or volume == 0 or volume >= momentum_threshold
+            if abs(movement) >= MOMENTUM_PRICE_PCT and volume_ok:
+                up = movement > 0
+                key = "momentumup" if up else "momentumdown"
                 if alert_allowed(conn, f"{symbol}:{key}", MOMENTUM_ALERT_COOLDOWN_SECONDS):
-                    rbv_now = client_metric(client, "buy_I_Volume")
-                    rsv_now = client_metric(client, "sell_I_Volume")
-                    rbc_now = client_metric(client, "buy_I_Count", "buy_CountI")
-                    rsc_now = client_metric(client, "sell_I_Count", "sell_CountI")
-
-                    m_buy_v = max(0.0, rbv_now - to_float(momentum_ref.get("real_buy_volume"), 0))
-                    m_sell_v = max(0.0, rsv_now - to_float(momentum_ref.get("real_sell_volume"), 0))
-                    m_buy_c = max(0, to_int(rbc_now, 0) - to_int(momentum_ref.get("real_buy_count"), 0))
-                    m_sell_c = max(0, to_int(rsc_now, 0) - to_int(momentum_ref.get("real_sell_count"), 0))
-                    m_net = m_buy_v - m_sell_v
-                    mlbv_now = client_metric(client, "buy_N_Volume")
-                    mlsv_now = client_metric(client, "sell_N_Volume")
-                    mlbc_now = client_metric(client, "buy_N_Count", "buy_CountN")
-                    mlsc_now = client_metric(client, "sell_N_Count", "sell_CountN")
-                    m_legal_buy_v = max(0.0, mlbv_now - to_float(momentum_ref.get("legal_buy_volume"), 0))
-                    m_legal_sell_v = max(0.0, mlsv_now - to_float(momentum_ref.get("legal_sell_volume"), 0))
-                    m_legal_buy_c = max(0, to_int(mlbc_now, 0) - to_int(momentum_ref.get("legal_buy_count"), 0))
-                    m_legal_sell_c = max(0, to_int(mlsc_now, 0) - to_int(momentum_ref.get("legal_sell_count"), 0))
-
-                    ref_day_pct = pct_change(ref_price, py) if py > 0 else 0.0
-                    if direction_up and ref_day_pct > 0 and last_pct > 0:
-                        title = "🟢 تقویت مثبت / خرید رو به بالا"
-                    elif direction_up:
-                        title = "📈 خرید رو به بالا / مومنتوم مثبت"
+                    if up:
+                        title = "🟢 تقویت مثبت / خرید رو به بالا" if ref_pct > 0 and last_pct > 0 else "📈 خرید رو به بالا / مومنتوم مثبت"
                     else:
                         title = "📉 فروش رو به پایین / مومنتوم منفی"
-
-                    alerts.append(format_trade_window_alert(conn, live, momentum_ref, captured_at, title))
-
-            # Positive -> stronger positive acceleration. Keep it below the main
-            # momentum trigger to avoid duplicate alerts when the move is >=1.20%.
-            ref_day_pct = pct_change(ref_price, py) if py > 0 else 0.0
-            positive_strengthen = last_pct - ref_day_pct
-            positive_volume_threshold = alert_threshold_shares(
-                conn, symbol, POSITIVE_STRENGTHEN_VOLUME_FRACTION
-            )
-            if (
-                ref_day_pct > 0
-                and last_pct > 0
-                and positive_strengthen >= POSITIVE_STRENGTHEN_PCT
-                and momentum_move < MOMENTUM_PRICE_PCT
-                and momentum_volume >= positive_volume_threshold
-            ):
-                if alert_allowed(
-                    conn,
-                    f"{symbol}:positive_strengthen",
-                    POSITIVE_STRENGTHEN_COOLDOWN_SECONDS,
-                ):
-                    rbv_now = client_metric(client, "buy_I_Volume")
-                    rsv_now = client_metric(client, "sell_I_Volume")
-                    m_buy_v = max(0.0, rbv_now - to_float(momentum_ref.get("real_buy_volume"), 0))
-                    m_sell_v = max(0.0, rsv_now - to_float(momentum_ref.get("real_sell_volume"), 0))
-                    mlbv_now = client_metric(client, "buy_N_Volume")
-                    mlsv_now = client_metric(client, "sell_N_Volume")
-                    mlbc_now = client_metric(client, "buy_N_Count", "buy_CountN")
-                    mlsc_now = client_metric(client, "sell_N_Count", "sell_CountN")
-                    m_legal_buy_v = max(0.0, mlbv_now - to_float(momentum_ref.get("legal_buy_volume"), 0))
-                    m_legal_sell_v = max(0.0, mlsv_now - to_float(momentum_ref.get("legal_sell_volume"), 0))
-                    m_legal_buy_c = max(0, to_int(mlbc_now, 0) - to_int(momentum_ref.get("legal_buy_count"), 0))
-                    m_legal_sell_c = max(0, to_int(mlsc_now, 0) - to_int(momentum_ref.get("legal_sell_count"), 0))
-                    alerts.append(format_trade_window_alert(conn, live, momentum_ref, captured_at, "🟢 تقویت مثبت"))
-
-        if prev_last_pct <= 0 < last_pct and (last_pct - prev_last_pct) >= 0.40:
+                    alerts.append(format_trade_window_alert(conn, live, price_ref, price_at, title,
+                                                            flow_reference=client_ref or {}))
+            strengthen_threshold = alert_threshold_shares(conn, symbol, POSITIVE_STRENGTHEN_VOLUME_FRACTION, date_value)
+            if (ref_pct > 0 and last_pct > 0 and last_pct-ref_pct >= POSITIVE_STRENGTHEN_PCT
+                    and movement < MOMENTUM_PRICE_PCT
+                    and (volume is None or volume == 0 or volume >= strengthen_threshold)
+                    and alert_allowed(conn, f"{symbol}:positive_strengthen", POSITIVE_STRENGTHEN_COOLDOWN_SECONDS)):
+                alerts.append(format_trade_window_alert(conn, live, price_ref, price_at, "🟢 تقویت مثبت",
+                                                        flow_reference=client_ref or {}))
+        if previous_pct <= 0 < last_pct and last_pct-previous_pct >= .40:
             if alert_allowed(conn, f"{symbol}:turnedgreen"):
-                alerts.append(format_trade_window_alert(conn, live, prev, captured_at, "🟢 تغییر فاز به مثبت"))
-        elif prev_last_pct >= 0 > last_pct and (prev_last_pct - last_pct) >= 0.40:
+                alerts.append(format_trade_window_alert(conn, live, previous_price, price_at, "🟢 تغییر فاز به مثبت",
+                                                        flow_reference=flow_ref or {}))
+        elif previous_pct >= 0 > last_pct and previous_pct-last_pct >= .40:
             if alert_allowed(conn, f"{symbol}:turnedred"):
-                alerts.append(format_trade_window_alert(conn, live, prev, captured_at, "🔴 تغییر فاز به منفی"))
+                alerts.append(format_trade_window_alert(conn, live, previous_price, price_at, "🔴 تغییر فاز به منفی",
+                                                        flow_reference=flow_ref or {}))
 
-        rows = get_daily_rows(conn, symbol)
-        prev_rows = [r for r in rows if to_int(r.get("date"), 0) < date_value and to_float(r.get("volume"), 0) > 0]
-        prev20 = prev_rows[-20:]
-        if prev20:
-            avg20 = sum(to_float(r.get("volume"), 0) for r in prev20) / len(prev20)
-            ratio20 = safe_div(day_volume, avg20)
-            prev_ratio20 = safe_div(prev_day_volume, avg20)
-            if ratio20 is not None and prev_ratio20 is not None:
-                if ratio20 >= VOLUME_RATIO_ALERT and prev_ratio20 < VOLUME_RATIO_ALERT:
-                    if alert_allowed(conn, f"{symbol}:volumeratio"):
-                        alerts.append(format_trade_window_alert(
-                            conn, live, prev, captured_at, "🔥 حجم غیرعادی"
-                        ))
+    observation = dict(captured_at=price_at, volume=official_volume,
+                       last_price=last_price, market_time=market_time)
+    if price_valid:
+        save_alert_sample(conn, symbol, date_value, "price", observation)
+    # Store raw official observations separately, solely for order-execution estimates.
+    if not prev or price_at > prev["captured_at"]:
+        save_alert_sample(conn, symbol, date_value, "observation", observation)
 
-    prev_book_for_state = previous_book_snapshot(conn, symbol, date_value, captured_at)
+    prev_book_for_state = previous_book_snapshot(conn, symbol, date_value, book_at)
     cur_book_for_state = live.get("best") or []
     if prev_book_for_state and cur_book_for_state:
         prev_state, prev_depth, prev_q_price = book_state(prev_book_for_state)
@@ -1421,31 +1485,31 @@ def detect_fast_alerts(conn, live, captured_at):
             if cur_state == "buy_queue" and cur_depth >= queue_threshold:
                 if alert_allowed(conn, f"{symbol}:buyqueue"):
                     alerts.append(format_book_alert(
-                        "🟢 صف خرید تشکیل شد", symbol, captured_at, price_yesterday,
+                        "🟢 صف خرید تشکیل شد", symbol, book_at, price_yesterday,
                         now=cur_depth, now_price=cur_q_price
                     ))
             elif cur_state == "sell_queue" and cur_depth >= queue_threshold:
                 if alert_allowed(conn, f"{symbol}:sellqueue"):
                     alerts.append(format_book_alert(
-                        "🔴 صف فروش تشکیل شد", symbol, captured_at, price_yesterday,
+                        "🔴 صف فروش تشکیل شد", symbol, book_at, price_yesterday,
                         now=cur_depth, now_price=cur_q_price
                     ))
             elif prev_state == "buy_queue" and cur_state == "normal":
                 if alert_allowed(conn, f"{symbol}:buyqueuebreak"):
                     alerts.append(format_book_alert(
-                        "⚠️ صف خرید باز شد", symbol, captured_at, price_yesterday,
+                        "⚠️ صف خرید باز شد", symbol, book_at, price_yesterday,
                         before=prev_depth, before_price=prev_q_price
                     ))
             elif prev_state == "sell_queue" and cur_state == "normal":
                 if alert_allowed(conn, f"{symbol}:sellqueuebreak"):
                     alerts.append(format_book_alert(
-                        "⚠️ صف فروش جمع شد/باز شد", symbol, captured_at, price_yesterday,
+                        "⚠️ صف فروش جمع شد/باز شد", symbol, book_at, price_yesterday,
                         before=prev_depth, before_price=prev_q_price
                     ))
 
         # Queue size can change gradually without changing state. Compare with a
         # 3-5 minute reference so both heavier and lighter queues are reported.
-        q_ref_book = queue_reference_snapshot(conn, symbol, date_value, captured_at)
+        q_ref_book = queue_reference_snapshot(conn, symbol, date_value, book_at)
         if q_ref_book:
             ref_state, ref_depth, ref_q_price = book_state(q_ref_book)
             if cur_state == ref_state and cur_state in ("buy_queue", "sell_queue") and ref_depth > 0:
@@ -1473,21 +1537,21 @@ def detect_fast_alerts(conn, live, captured_at):
                         cur_queue_value_toman = estimate_trade_value_toman(cur_depth, cur_q_price)
                         delta_queue_value_toman = cur_queue_value_toman - ref_queue_value_toman
                         alerts.append(format_book_alert(
-                            q_title, symbol, captured_at, price_yesterday,
+                            q_title, symbol, book_at, price_yesterday,
                             before=ref_depth, now=cur_depth,
                             before_price=ref_q_price, now_price=cur_q_price
                         ))
 
     # Order deletion / movement: compare same-price visible levels with previous 30s book.
-    prev_book = previous_book_snapshot(conn, symbol, date_value, captured_at)
+    prev_book = previous_book_snapshot(conn, symbol, date_value, book_at)
     cur_book = live.get("best") or []
-    if prev_book and cur_book:
+    if prev_book and cur_book and official_delta is not None:
         cur_by_buy = {to_float(r.get("pMeDem"), 0): r for r in cur_book if isinstance(r, dict) and to_float(r.get("pMeDem"), 0) > 0}
         cur_by_sell = {to_float(r.get("pMeOf"), 0): r for r in cur_book if isinstance(r, dict) and to_float(r.get("pMeOf"), 0) > 0}
 
         day_volume = to_float(current.get("qTotTran5J"), 0)
         prev_day_volume = to_float(prev.get("volume"), 0) if prev else 0
-        traded_delta = max(0.0, day_volume - prev_day_volume)
+        traded_delta = official_delta
         oth = alert_threshold_shares(conn, symbol, ORDER_ALERT_DAILY_VOLUME_FRACTION)
 
         for old in prev_book:
@@ -1498,7 +1562,7 @@ def detect_fast_alerts(conn, live, captured_at):
                 drop = bv - newv
                 if drop >= oth and traded_delta < drop * 0.5 and alert_allowed(conn, f"{symbol}:buycancel:{int(bp)}"):
                     alerts.append(format_book_alert(
-                        "⚠️ حذف/جابجایی مشکوک سفارش خرید", symbol, captured_at, price_yesterday,
+                        "⚠️ حذف/جابجایی مشکوک سفارش خرید", symbol, book_at, price_yesterday,
                         label="سفارش", before=bv, now=newv,
                         before_price=bp, now_price=bp, traded=traded_delta
                     ))
@@ -1510,7 +1574,7 @@ def detect_fast_alerts(conn, live, captured_at):
                 drop = sv - newv
                 if drop >= oth and traded_delta < drop * 0.5 and alert_allowed(conn, f"{symbol}:sellcancel:{int(sp)}"):
                     alerts.append(format_book_alert(
-                        "⚠️ حذف/جابجایی مشکوک سفارش فروش", symbol, captured_at, price_yesterday,
+                        "⚠️ حذف/جابجایی مشکوک سفارش فروش", symbol, book_at, price_yesterday,
                         label="سفارش", before=sv, now=newv,
                         before_price=sp, now_price=sp, traded=traded_delta
                     ))
@@ -2386,6 +2450,7 @@ def collect_live_symbol(conn, symbol):
         allow_fail=False,
     )
     current = unwrap_dict(p, ("closingPriceInfo",))
+    price_received_at = received_clock()
 
     market_date = to_int(
         current.get("dEven"),
@@ -2416,6 +2481,7 @@ def collect_live_symbol(conn, symbol):
     # Client type
     # --------------------------------------------------------
     client = {}
+    client_received_at = None
 
     if FETCH_CLIENT_TYPE:
         p = api_get(
@@ -2424,11 +2490,13 @@ def collect_live_symbol(conn, symbol):
             "ClientTypeCurrent",
         )
         client = unwrap_dict(p, ("clientType",))
+        client_received_at = received_clock()
 
     # --------------------------------------------------------
     # Best limits
     # --------------------------------------------------------
     best = []
+    book_received_at = None
 
     if FETCH_BEST_LIMITS:
         p = api_get(
@@ -2437,6 +2505,7 @@ def collect_live_symbol(conn, symbol):
             "BestLimitsCurrent",
         )
         best = unwrap_list(p, ("bestLimits",))
+        book_received_at = received_clock()
 
         for r in best:
             if isinstance(r, dict):
@@ -2572,6 +2641,10 @@ def collect_live_symbol(conn, symbol):
 
     return {
         "symbol": symbol,
+        "capture_source": "heavy",
+        "price_received_at": price_received_at,
+        "client_received_at": client_received_at,
+        "book_received_at": book_received_at,
         "inscode": inscode,
         "current": current,
         "client": client,
@@ -2829,7 +2902,9 @@ def make_summary(conn, live):
     enriched = enrich_history(history_raw)
 
     market_date = to_int(current.get("dEven"), 0)
-    live_volume = to_float(current.get("qTotTran5J"), 0)
+    official_volume = to_float(current.get("qTotTran5J"), 0)
+    sample = published_client_snapshot(conn, live)
+    live_volume = sample["classified_volume"] if sample else None
     live_value = to_float(current.get("qTotCap"), 0)
     live_trades = to_float(current.get("zTotTran"), 0)
     live_last = to_float(current.get("pDrCotVal"), 0)
@@ -2863,33 +2938,37 @@ def make_summary(conn, live):
     technical_source = tech
     provisional = False
 
-    if live_volume > 0 and enriched and to_int(tech.get("date"), 0) == market_date:
+    if official_volume > 0 and enriched and to_int(tech.get("date"), 0) == market_date:
         provisional = not bool(tech.get("finalized"))
     else:
         technical_source = last_hist
 
-    buy_i_vol = client_metric(client, "buy_I_Volume")
-    sell_i_vol = client_metric(client, "sell_I_Volume")
-    buy_n_vol = client_metric(client, "buy_N_Volume")
-    sell_n_vol = client_metric(client, "sell_N_Volume")
+    buy_i_vol = sample["real_buy_volume"] if sample else None
+    sell_i_vol = sample["real_sell_volume"] if sample else None
+    buy_n_vol = sample["legal_buy_volume"] if sample else None
+    sell_n_vol = sample["legal_sell_volume"] if sample else None
 
-    buy_i_count = client_metric(client, "buy_I_Count", "buy_CountI")
-    sell_i_count = client_metric(client, "sell_I_Count", "sell_CountI")
+    buy_i_count = sample["real_buy_count"] if sample else None
+    sell_i_count = sample["real_sell_count"] if sample else None
 
     buy_i_value = client_metric(client, "buy_I_Value")
     sell_i_value = client_metric(client, "sell_I_Value")
+    raw_sample = client_snapshot(live)
+    values_match_sample = sample and raw_sample["ready"] and all(
+        sample[key] == raw_sample[key] for key in CLIENT_FIELDS
+    )
 
-    real_net_vol = buy_i_vol - sell_i_vol
+    real_net_vol = buy_i_vol-sell_i_vol if sample else None
 
     real_net_value = (
         buy_i_value - sell_i_value
-        if (buy_i_value or sell_i_value)
+        if values_match_sample and (buy_i_value or sell_i_value)
         else None
     )
 
     real_net_approx = (
         real_net_vol * live_last
-        if live_last > 0 else None
+        if sample and live_last > 0 else None
     )
 
     avg_buy_vol_per_buyer = safe_div(buy_i_vol, buy_i_count)
@@ -2937,6 +3016,10 @@ def make_summary(conn, live):
         "High": to_float(current.get("priceMax"), 0),
 
         "LiveVolume": live_volume,
+        "OfficialVolume": official_volume,
+        "VolumeBasis": "CLIENT_TYPE",
+        "ClientStatus": "READY" if sample else "UNAVAILABLE",
+        "ClientReceivedAt": sample["captured_at"] if sample else None,
         "LiveValue_Rial": live_value,
         "LiveValue_BnToman": live_value / 1e10,
         "LiveTrades": live_trades,
@@ -2951,8 +3034,8 @@ def make_summary(conn, live):
         "RealNetVolume": real_net_vol,
         "RealBuyCount": buy_i_count,
         "RealSellCount": sell_i_count,
-        "LegalBuyCount": client_metric(client, "buy_N_Count", "buy_CountN"),
-        "LegalSellCount": client_metric(client, "sell_N_Count", "sell_CountN"),
+        "LegalBuyCount": sample["legal_buy_count"] if sample else None,
+        "LegalSellCount": sample["legal_sell_count"] if sample else None,
         "AvgRealBuyVolume": avg_buy_vol_per_buyer,
         "AvgRealSellVolume": avg_sell_vol_per_seller,
 
@@ -2970,7 +3053,7 @@ def make_summary(conn, live):
 
         "LegalBuyVolume": buy_n_vol,
         "LegalSellVolume": sell_n_vol,
-        "LegalNetVolume": buy_n_vol - sell_n_vol,
+        "LegalNetVolume": buy_n_vol-sell_n_vol if sample else None,
 
         "RSI14": technical_source.get("RSI14"),
         "MACD": technical_source.get("MACD"),
@@ -3091,14 +3174,14 @@ def write_readme(wb):
     rows = [
         ("TSETMC LIVE FAST", "Light intraday updater; full history is stored locally, not re-downloaded."),
         ("Persistent DB", str(DB_PATH)),
-        ("SUMMARY", "Live price/volume/client-type + comparison against local history."),
+        ("SUMMARY", "LiveVolume/volume ratios use ClientType; OfficialVolume/LiveValue/LiveTrades retain the official feed. Daily history retains official finalized data."),
         ("MARKET_INDICES", "Current TSETMC شاخص کل and شاخص کل هم‌وزن on every run."),
         ("INDEX_HISTORY_260D", "Last up to 260 historical rows for both market indices."),
         ("DAILY_260D", "Last 260 daily sessions: adjusted price, volume, RSI, MACD, SMA, OBV."),
         ("MONTHLY_ALL", "Compact complete monthly history for long-term trend and Elliott context."),
         ("PV_5M_TODAY", "Today's real TSETMC trade-price path in 5-minute buckets (TradeHistory/TradeIntraDay)."),
         ("PV_QUALITY", "Intraday price-path quality; official daily volume still comes from ClosingPriceInfo."),
-        ("CLIENT_INTRADAY", "Time-stamped cumulative buyer/seller counts, volumes, BP and net flow during the day."),
+        ("CLIENT_INTRADAY", "Raw endpoint receipt times and source; volume=official, classified_volume=one ClientType side. Missing/stale packets carry quality flags."),
         ("CLIENT_CURRENT", "Current real/legal participation."),
         ("BEST_LIMITS", "Current top bid/ask levels."),
         ("BEST_LIMITS_INTRADAY", "30-second order-book history for cancellation/movement analysis."),
@@ -3337,12 +3420,15 @@ def build_status_text(conn, live_data):
         real_net = to_float(s.get("RealNetVolume"), 0)
 
         lines.append("")
-        lines.append(f"▪️ {symbol}")
+        lines.append(f"▪️ {symbol_tag(symbol)}")
         lines.append(f"آخرین: {fmt_price_pct(last_price, pct=last_pct)} {pct_emoji(last_pct)}")
         lines.append(f"پایانی: {fmt_price_pct(close_price, pct=close_pct)} {pct_emoji(close_pct)}")
+        if s.get("LiveVolume") is None:
+            continue
         vr_txt = f"{to_float(vr20,0):.2f}×" if vr20 is not None else "-"
-        lines.append(f"حجم: {fmt_compact_num(volume)} | {vr_txt} میانگین ۲۰روزه")
-        lines.append(f"خالص حقیقی: {fmt_compact_num(real_net)} {'🟢' if real_net>0 else '🔴' if real_net<0 else '⚪️'}")
+        lines.append(f"حجم تفکیکی: {fmt_compact_num(volume)} | {vr_txt} میانگین ۲۰روزه")
+        if real_net:
+            lines.append(f"خالص حقیقی: {fmt_compact_num(real_net)} {'🟢' if real_net>0 else '🔴'}")
         legal_buy = to_float(s.get("LegalBuyVolume"), 0)
         legal_sell = to_float(s.get("LegalSellVolume"), 0)
         legal_net = to_float(s.get("LegalNetVolume"), 0)
@@ -3422,12 +3508,26 @@ def split_telegram_text(text, max_units=3500):
 
 
 def eod_client_history(conn, symbol, market_date):
-    rows = conn.execute("""
-        SELECT * FROM client_intraday
-        WHERE symbol=? AND date=? AND volume>0
-        ORDER BY captured_at
-    """, (symbol, market_date)).fetchall()
-    return [dict(row) for row in rows]
+    accepted = conn.execute("""SELECT payload FROM alert_samples
+        WHERE symbol=? AND date=? AND kind='client' ORDER BY captured_at""",
+                            (symbol, market_date)).fetchall()
+    if accepted:
+        return [json.loads(row["payload"]) for row in accepted]
+    # Compatibility for a pre-upgrade database. Raw legacy data is never used for live alert baselines.
+    rows = conn.execute("""SELECT * FROM client_intraday WHERE symbol=? AND date=? AND volume>0
+        ORDER BY captured_at""", (symbol, market_date)).fetchall()
+    result = []
+    for row in map(dict, rows):
+        if any(row.get(k) is None or not math.isfinite(row[k]) or row[k] < 0 for k in CLIENT_FIELDS):
+            continue
+        total = row["real_buy_volume"]+row["legal_buy_volume"]
+        if total <= 0 or total != row["real_sell_volume"]+row["legal_sell_volume"]:
+            continue
+        if result and any(row[k] < result[-1][k] for k in CLIENT_FIELDS):
+            continue
+        row.update(ready=True, classified_volume=total, epoch=0)
+        result.append(row)
+    return result
 
 
 def eod_bp_history_line(rows, final_bp):
@@ -3501,7 +3601,7 @@ def build_channel_eod_text(conn, live_data, report_complete=True):
     for symbol in SYMBOLS:
         live = by_symbol.get(symbol)
         if not live:
-            sections.append(f"▪️ {symbol}: داده پایان بازار دریافت نشد.")
+            sections.append(f"▪️ {symbol_tag(symbol)}: داده پایان بازار دریافت نشد.")
             continue
         try:
             summary = make_summary(conn, live)
@@ -3509,29 +3609,32 @@ def build_channel_eod_text(conn, live_data, report_complete=True):
             day = to_int(current.get("dEven"), 0)
             volume = to_float(summary.get("LiveVolume"), 0)
             if day != date_value:
-                sections.append(f"▪️ {symbol}: داده تازه امروز موجود نیست.")
+                sections.append(f"▪️ {symbol_tag(symbol)}: داده تازه امروز موجود نیست.")
                 continue
-            if volume <= 0:
-                sections.append(f"▪️ {symbol}: امروز معامله‌ای ثبت نشد.")
+            if to_float(summary.get("OfficialVolume"), 0) <= 0:
+                sections.append(f"▪️ {symbol_tag(symbol)}: امروز معامله‌ای ثبت نشد.")
                 continue
             last = to_float(summary.get("LastPrice"), 0)
             close = to_float(summary.get("ClosingPrice"), 0)
             if last <= 0:
-                sections.append(f"▪️ {symbol}: قیمت پایان بازار دریافت نشد.")
+                sections.append(f"▪️ {symbol_tag(symbol)}: قیمت پایان بازار دریافت نشد.")
                 continue
             day_pct = to_float(summary.get("LastChangePct"), 0)
+            if summary.get("LiveVolume") is None:
+                sections.append(f"{pct_emoji(day_pct)} {symbol_tag(symbol)}\nآخرین: " + alert_ltr(fmt_price_pct(last, pct=day_pct)))
+                continue
             bp = real_buyer_power(
                 summary.get("RealBuyVolume"), summary.get("RealSellVolume"),
                 summary.get("RealBuyCount"), summary.get("RealSellCount"),
             )
             rows = eod_client_history(conn, symbol, day)
-            lines = [f"{pct_emoji(day_pct)} {symbol}"]
+            lines = [f"{pct_emoji(day_pct)} {symbol_tag(symbol)}"]
             lines.append("آخرین: " + alert_ltr(fmt_price_pct(last, pct=day_pct)))
             if close > 0 and close != last:
                 lines.append("پایانی: " + alert_ltr(fmt_price_pct(close, pct=summary.get("ClosingChangePct"))))
             lines.append(eod_bp_history_line(rows, bp))
             ratio = summary.get("VolumeRatio20_Live")
-            activity = "حجم: " + alert_shares(volume)
+            activity = "حجم تفکیکی: " + alert_shares(volume)
             if ratio is not None:
                 activity += "؛ " + alert_ltr(f"{to_float(ratio, 0):.2f}") + " برابر میانگین۲۰"
             lines.append(activity)
@@ -3599,9 +3702,9 @@ def build_channel_eod_text(conn, live_data, report_complete=True):
                 lines.insert(1, " ".join(comments))
             sections.append("\n".join(lines))
         except Exception as exc:
-            print(f"EOD commentary unavailable for {symbol}: {exc}")
-            sections.append(f"▪️ {symbol}: داده کافی برای جمع‌بندی موجود نیست.")
-    sections.append("قیمت‌ها ریال؛ ارزش خالص حقیقی با قیمت آخر برآورد شده است.")
+            print(f"EOD commentary unavailable for {symbol_tag(symbol)}: {exc}")
+            sections.append(f"▪️ {symbol_tag(symbol)}: داده کافی برای جمع‌بندی موجود نیست.")
+    sections.append("قیمت‌ها ریال؛ حجم از آمار تفکیکی و ارزش‌ها برآورد با قیمت آخر است.")
     return "\n\n".join(sections)
 
 
@@ -3649,6 +3752,7 @@ def collect_fast_symbol(conn, symbol):
         allow_fail=False,
     )
     current = unwrap_dict(p, ("closingPriceInfo",))
+    price_received_at = received_clock()
 
     market_date = to_int(
         current.get("dEven"),
@@ -3663,6 +3767,7 @@ def collect_fast_symbol(conn, symbol):
         upsert_daily(conn, symbol, inscode, current, finalized=is_final)
 
     client = {}
+    client_received_at = None
     if FETCH_CLIENT_TYPE:
         p = api_get(
             f"ClientType/GetClientType/{inscode}/1/0",
@@ -3670,8 +3775,10 @@ def collect_fast_symbol(conn, symbol):
             "FAST_ClientTypeCurrent",
         )
         client = unwrap_dict(p, ("clientType",))
+        client_received_at = received_clock()
 
     best = []
+    book_received_at = None
     if FETCH_BEST_LIMITS:
         p = api_get(
             f"BestLimits/{inscode}",
@@ -3679,12 +3786,17 @@ def collect_fast_symbol(conn, symbol):
             "FAST_BestLimitsCurrent",
         )
         best = unwrap_list(p, ("bestLimits",))
+        book_received_at = received_clock()
         for r in best:
             if isinstance(r, dict):
                 r["Symbol"] = symbol
 
     return {
         "symbol": symbol,
+        "capture_source": "fast",
+        "price_received_at": price_received_at,
+        "client_received_at": client_received_at,
+        "book_received_at": book_received_at,
         "inscode": inscode,
         "current": current,
         "client": client,
@@ -3702,20 +3814,20 @@ def run_fast_snapshot(conn):
     global API_STATUS
     API_STATUS = []
     started = time.time()
-    captured_at = tehran_now().strftime("%H:%M:%S")
     live_data = []
 
     for symbol in SYMBOLS:
         try:
             live = collect_fast_symbol(conn, symbol)
             live_data.append(live)
+            captured_at = live.get("client_received_at") or received_clock()
 
             # Compare against the previous 30-second snapshot before persisting the current one.
             for alert_text in detect_fast_alerts(conn, live, captured_at):
                 telegram_broadcast_message(alert_text)
 
             save_client_intraday(conn, live, captured_at=captured_at)
-            save_best_limits_intraday(conn, live, captured_at=captured_at)
+            save_best_limits_intraday(conn, live)
         except Exception as e:
             print(f"FAST {symbol} failed: {e}")
             API_STATUS.append({
@@ -3742,15 +3854,14 @@ def run_once(conn, output_path=None):
         output_path = APP_DIR / f"TSETMC_LIVE_{stamp}.xlsx"
 
     live_data = []
-    captured_at = now.strftime("%H:%M:%S")
 
     for symbol in SYMBOLS:
         print(f"Fetching {symbol} ...")
         try:
             live = collect_live_symbol(conn, symbol)
             live_data.append(live)
-            save_client_intraday(conn, live, captured_at=captured_at)
-            save_best_limits_intraday(conn, live, captured_at=captured_at)
+            save_client_intraday(conn, live)
+            save_best_limits_intraday(conn, live)
         except Exception as e:
             print(f"  FAILED: {e}")
             API_STATUS.append({
