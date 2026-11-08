@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
   schedule:
     # 08:55 Iran time (UTC+3:30), Saturday through Wednesday
-   - cron: '40 4 * * 0-3,6'
+   - cron: '30 3 * * 6,0-3'
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 270
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
