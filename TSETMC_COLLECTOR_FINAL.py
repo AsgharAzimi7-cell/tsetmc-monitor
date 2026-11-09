@@ -24,8 +24,6 @@ Persistent local files - DO NOT DELETE:
 
 The light Excel contains:
     SUMMARY          = current market snapshot + comparison with history
-    DAILY_260D       = compact last 260 trading sessions for technical analysis
-    MONTHLY_ALL      = compact full monthly history for long-term trend/Elliott
     PV_5M_TODAY      = today's real TSETMC trade-price path in 5-minute buckets
     PV_QUALITY       = intraday data-quality check
     CLIENT_CURRENT   = current حقیقی/حقوقی
@@ -35,7 +33,9 @@ The light Excel contains:
     MESSAGES         = cached/recent TSETMC messages
     API_STATUS       = request status
 
-The full V4 history is therefore NOT downloaded on every run.
+Set TSETMC_EXPORT_HISTORY=1 for an occasional export with DAILY_260D,
+MONTHLY_ALL and INDEX_HISTORY_260D. Price history remains in the database
+and feeds the indicators in SUMMARY even when those sheets are omitted.
 
 Alert volume and published daily volume use one matched ClientType side
 (real + legal buys = real + legal sells). Their receipt times describe feed
@@ -73,6 +73,7 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
+EXPORT_HISTORY_SHEETS = os.getenv("TSETMC_EXPORT_HISTORY", "0") == "1"
 
 # Fast alerts: intentionally conservative to avoid Telegram spam.
 ALERT_COOLDOWN_SECONDS = max(30, int(os.getenv("ALERT_COOLDOWN_SECONDS", "180")))
@@ -1125,6 +1126,12 @@ def alert_shares(value):
     return alert_ltr(fmt_compact_num(value)) + " سهم"
 
 
+def book_shares(value):
+    amount = fmt_compact_num(value)
+    unit = {"K": "هزار", "M": "میلیون", "B": "میلیارد"}.get(amount[-1])
+    return f"{amount[:-1]} {unit} سهم" if unit else amount + " سهم"
+
+
 def alert_money(value):
     value = to_float(value, 0)
     if abs(value) >= 1_000_000_000:
@@ -1146,7 +1153,7 @@ def format_estimated_side_average(side, volume, new_people, price, group="حقی
         line += f"\nسرانه تخمینی ({alert_ltr(f'{new_people:,.0f}')} نفر جدید): {alert_shares(average)}"
         if price > 0:
             line += " ≈ " + alert_money(estimate_trade_value_toman(average, price))
-    else:
+    elif group != "حقیقی":
         person = "خریدار" if side == "خرید" else "فروشنده"
         line += f"\n{person} جدید اضافه نشد"
     return line
@@ -1177,17 +1184,19 @@ def format_trade_window_alert(conn, live, reference, captured_at, title, extra="
     cur_sec, ref_sec = _hms_to_seconds(price_at), _hms_to_seconds(reference.get("captured_at"))
     minutes = (cur_sec-ref_sec)/60 if cur_sec is not None and ref_sec is not None and cur_sec >= ref_sec else None
     current_display = fmt_price_pct(price, yesterday)
-    display = alert_rtl_change(fmt_price_pct(old_price, yesterday), current_display) if old_price > 0 else alert_ltr(current_display)
+    display = (alert_rtl_change(fmt_price_pct(old_price, yesterday), current_display)
+               if old_price > 0 and old_price != price else alert_ltr(current_display))
     sections = [f"قیمت: {display}"]
     if change and change["classified_volume"] > 0:
         total = change["classified_volume"]
         clock = alert_rtl_change(str(flow_reference["captured_at"]).split(".")[0],
                                  str(sample["captured_at"]).split(".")[0])
-        sections.append(f"به‌روزرسانی تفکیک: {clock}\n"
-                        f"حجم افزوده: {alert_shares(total)} ≈ {alert_money(estimate_trade_value_toman(total, price))}")
+        sections.append(f"زمان دریافت آمار: {clock}\n"
+                        f"حجم بازه: {alert_shares(total)} ≈ {alert_money(estimate_trade_value_toman(total, price))}")
         real_lines = [format_estimated_side_average(side, change[f"real_{key}_volume"],
                        change[f"real_{key}_count"], price)
-                      for side, key in (("خرید", "buy"), ("فروش", "sell"))]
+                      for side, key in (("خرید", "buy"), ("فروش", "sell"))
+                      if change[f"real_{key}_volume"] > 0]
         sections.append("\n\n".join(real_lines))
         legal = format_legal_flow(change["legal_buy_volume"], change["legal_sell_volume"],
                                   price, change["legal_buy_count"], change["legal_sell_count"])
@@ -1205,8 +1214,8 @@ def format_trade_window_alert(conn, live, reference, captured_at, title, extra="
                                         flow_reference)]
         day_volume = sample["classified_volume"]
         if change and change["classified_volume"] > 0:
-            daily.append("سهم افزایش از حجم امروز: " + alert_ltr(f'{100*change["classified_volume"]/day_volume:.2f}%'))
-        line = "حجم تفکیکی امروز: " + alert_shares(day_volume)
+            daily.append("سهم بازه از حجم کل: " + alert_ltr(f'{100*change["classified_volume"]/day_volume:.2f}%'))
+        line = "حجم کل: " + alert_shares(day_volume)
         average, sessions = previous_volume_average(conn, live.get("symbol") or "?",
                                                      to_int(current.get("dEven"), 0))
         if average:
@@ -1220,11 +1229,10 @@ def format_trade_window_alert(conn, live, reference, captured_at, title, extra="
 
 
 def format_legal_flow(buy_v, sell_v, price_rial, buy_count_delta=0, sell_count_delta=0, label="حقوقی"):
-    if not (buy_v or sell_v or buy_count_delta or sell_count_delta):
-        return ""
     return "\n\n".join(format_estimated_side_average(side, volume, count, price_rial, label)
                           for side, volume, count in (("خرید", buy_v, buy_count_delta),
-                                                       ("فروش", sell_v, sell_count_delta)))
+                                                       ("فروش", sell_v, sell_count_delta))
+                          if volume > 0)
 
 
 def format_book_alert(title, symbol, captured_at, yesterday, label="صف",
@@ -1235,7 +1243,8 @@ def format_book_alert(title, symbol, captured_at, yesterday, label="صف",
     elif max(before_price, now_price) > 0:
         lines.append("قیمت: " + alert_ltr(fmt_price_pct(now_price or before_price, yesterday)))
     if before is not None and now is not None:
-        lines.append(f"حجم {label}: " + alert_rtl_change(fmt_compact_num(before), fmt_compact_num(now)) + " سهم")
+        # Keep Persian units on both operands even if the client strips direction isolates.
+        lines.append(f"حجم {label}: " + alert_rtl_change(book_shares(before), book_shares(now)))
         if before > 0:
             lines.append("تغییر: " + alert_ltr(f"{pct_change(now, before):+.1f}%"))
     elif now is not None:
@@ -1250,7 +1259,7 @@ def format_book_alert(title, symbol, captured_at, yesterday, label="صف",
         lines.append("ارزش: " + alert_money(estimate_trade_value_toman(now, now_price)))
     elif before is not None and before_price > 0:
         lines.append("ارزش قبلی: " + alert_money(estimate_trade_value_toman(before, before_price)))
-    if traded is not None:
+    if traded is not None and traded > 0:
         lines.append(f"معامله بازه: {alert_shares(traded)}")
     return format_market_alert(title, symbol, captured_at, ["\n".join(lines)])
 
@@ -1333,20 +1342,21 @@ def detect_fast_alerts(conn, live, captured_at):
     change = client_interval(sample, flow_ref)
     threshold = alert_threshold_shares(conn, symbol, date_value=date_value)
     if change:
+        flow_reports = []
+        volume_title = "📊 حجم قابل‌توجه در بازهٔ کوتاه"
         heavy_buy = (change["real_buy_volume"] >= threshold
                      and change["real_buy_count"] <= CONCENTRATED_MAX_NEW_PEOPLE)
         heavy_sell = (change["real_sell_volume"] >= threshold
                       and change["real_sell_count"] <= CONCENTRATED_MAX_NEW_PEOPLE)
         if (heavy_buy or heavy_sell) and alert_allowed(conn, f"{symbol}:realflow"):
-            alerts.append(format_trade_window_alert(conn, live, flow_ref, client_at,
-                                                    "🚨 معاملات سنگین حقیقی"))
+            flow_reports.append((flow_ref, "🚨 معاملات سنگین حقیقی"))
         legal_net = change["legal_buy_volume"]-change["legal_sell_volume"]
         legal_threshold = alert_threshold_shares(conn, symbol, LEGAL_FLOW_DAILY_VOLUME_FRACTION, date_value)
         if abs(legal_net) >= legal_threshold:
             side = "buy" if legal_net > 0 else "sell"
             if alert_allowed(conn, f"{symbol}:legalflow:{side}", LEGAL_FLOW_COOLDOWN_SECONDS):
                 title = "🏢 خرید خالص سنگین حقوقی" if legal_net > 0 else "🏢 فروش خالص سنگین حقوقی"
-                alerts.append(format_trade_window_alert(conn, live, flow_ref, client_at, title))
+                flow_reports.append((flow_ref, title))
 
         # No price-change or participant-count gate for the independent volume signal.
         # The reported boundary prevents overlapping rolling windows reporting old volume.
@@ -1383,15 +1393,29 @@ def detect_fast_alerts(conn, live, captured_at):
                 pending_ref = burst_ref
             meta_set(conn, pending_key, json.dumps(pending_ref, ensure_ascii=False))
         if pending_ref and alert_allowed(conn, f"{symbol}:volume_burst", VOLUME_BURST_COOLDOWN_SECONDS):
-            alerts.append(format_trade_window_alert(conn, live, pending_ref, client_at,
-                                                    "📊 افزایش سنگین حجم تفکیکی"))
+            flow_reports.append((pending_ref, volume_title))
             meta_set(conn, boundary_key, json.dumps(sample, ensure_ascii=False))
             meta_set(conn, pending_key, "null")
 
         average, _ = previous_volume_average(conn, symbol, date_value)
         if average and flow_ref["classified_volume"]/average < VOLUME_RATIO_ALERT <= sample["classified_volume"]/average:
             if alert_allowed(conn, f"{symbol}:volumeratio"):
-                alerts.append(format_trade_window_alert(conn, live, flow_ref, client_at, "🔥 حجم غیرعادی"))
+                flow_reports.append((flow_ref, "🔥 حجم غیرعادی"))
+
+        # All candidates end at the same accepted snapshot. Compare the nested
+        # windows by traded shares and report the shortest when they mostly coincide.
+        groups = []
+        for ref, title in sorted(flow_reports, key=lambda report: report[0]["captured_at"], reverse=True):
+            volume = sample["classified_volume"] - ref["classified_volume"]
+            if groups and groups[-1][1] > 0 and 10 * groups[-1][1] >= 9 * volume:
+                groups[-1][2].append(title)
+            else:
+                groups.append((ref, volume, [title]))
+        for ref, _, titles in groups:
+            title = volume_title if volume_title in titles else titles[0]
+            other_signals = [signal.split(" ", 1)[1] for signal in titles if signal != title]
+            extra = " · ".join(other_signals)
+            alerts.append(format_trade_window_alert(conn, live, ref, client_at, title, extra=extra))
 
     price_valid = current_has_trades(current) and price_yesterday > 0
     if previous_price and (price_at <= previous_price["captured_at"]
@@ -3176,9 +3200,7 @@ def write_readme(wb):
         ("Persistent DB", str(DB_PATH)),
         ("SUMMARY", "LiveVolume/volume ratios use ClientType; OfficialVolume/LiveValue/LiveTrades retain the official feed. Daily history retains official finalized data."),
         ("MARKET_INDICES", "Current TSETMC شاخص کل and شاخص کل هم‌وزن on every run."),
-        ("INDEX_HISTORY_260D", "Last up to 260 historical rows for both market indices."),
-        ("DAILY_260D", "Last 260 daily sessions: adjusted price, volume, RSI, MACD, SMA, OBV."),
-        ("MONTHLY_ALL", "Compact complete monthly history for long-term trend and Elliott context."),
+        ("History export", "Set TSETMC_EXPORT_HISTORY=1 to include DAILY_260D, MONTHLY_ALL and INDEX_HISTORY_260D."),
         ("PV_5M_TODAY", "Today's real TSETMC trade-price path in 5-minute buckets (TradeHistory/TradeIntraDay)."),
         ("PV_QUALITY", "Intraday price-path quality; official daily volume still comes from ClosingPriceInfo."),
         ("CLIENT_INTRADAY", "Raw endpoint receipt times and source; volume=official, classified_volume=one ClientType side. Missing/stale packets carry quality flags."),
@@ -3251,19 +3273,10 @@ def build_output(conn, live_data, output_path, market_indices=None, index_histor
 
         summaries.append(make_summary(conn, live))
 
-        enriched = enrich_history(get_daily_rows(conn, symbol))
-
-        all_daily.extend(
-            compact_daily_rows(
-                enriched,
-                symbol,
-                DAILY_CONTEXT_DAYS
-            )
-        )
-
-        all_monthly.extend(
-            monthly_history(enriched, symbol)
-        )
+        if EXPORT_HISTORY_SHEETS:
+            enriched = enrich_history(get_daily_rows(conn, symbol))
+            all_daily.extend(compact_daily_rows(enriched, symbol, DAILY_CONTEXT_DAYS))
+            all_monthly.extend(monthly_history(enriched, symbol))
 
         all_pv.extend(live.get("pv", []))
         all_quality.append(live.get("pv_quality", {}))
@@ -3286,12 +3299,14 @@ def build_output(conn, live_data, output_path, market_indices=None, index_histor
     if c:
         for r in range(2, ws_idx.max_row + 1):
             ws_idx.cell(r, c).number_format = "0.00"
-    write_sheet(wb, "INDEX_HISTORY_260D", index_history or [], rtl=True)
+    if EXPORT_HISTORY_SHEETS:
+        write_sheet(wb, "INDEX_HISTORY_260D", index_history or [], rtl=True)
 
     write_sheet(wb, "PV_5M_TODAY", all_pv)
     write_sheet(wb, "PV_QUALITY", all_quality)
-    write_sheet(wb, "DAILY_260D", all_daily)
-    write_sheet(wb, "MONTHLY_ALL", all_monthly)
+    if EXPORT_HISTORY_SHEETS:
+        write_sheet(wb, "DAILY_260D", all_daily)
+        write_sheet(wb, "MONTHLY_ALL", all_monthly)
 
     market_dates = [to_int((x.get("current") or {}).get("dEven"), 0) for x in live_data]
     market_dates = [d for d in market_dates if d]
@@ -3426,19 +3441,20 @@ def build_status_text(conn, live_data):
         if s.get("LiveVolume") is None:
             continue
         vr_txt = f"{to_float(vr20,0):.2f}×" if vr20 is not None else "-"
-        lines.append(f"حجم تفکیکی: {fmt_compact_num(volume)} | {vr_txt} میانگین ۲۰روزه")
+        lines.append(f"حجم کل: {fmt_compact_num(volume)} | {vr_txt} میانگین ۲۰روزه")
         if real_net:
             lines.append(f"خالص حقیقی: {fmt_compact_num(real_net)} {'🟢' if real_net>0 else '🔴'}")
         legal_buy = to_float(s.get("LegalBuyVolume"), 0)
         legal_sell = to_float(s.get("LegalSellVolume"), 0)
         legal_net = to_float(s.get("LegalNetVolume"), 0)
-        legal_net_value = estimate_trade_value_toman(abs(legal_net), last_price)
-        legal_icon = '🟢' if legal_net > 0 else '🔴' if legal_net < 0 else '⚪️'
-        legal_side = 'خالص خرید' if legal_net > 0 else 'خالص فروش' if legal_net < 0 else 'خالص صفر'
-        lines.append(
-            f"حقوقی: خرید {fmt_compact_num(legal_buy)} | فروش {fmt_compact_num(legal_sell)} | "
-            f"{legal_side} {fmt_compact_num(abs(legal_net))} سهم ≈ {fmt_toman(legal_net_value)} تومان {legal_icon}"
-        )
+        legal_parts = [f"{side} {alert_shares(amount)}"
+                       for side, amount in (("خرید", legal_buy), ("فروش", legal_sell)) if amount > 0]
+        if legal_net:
+            legal_side = "خالص خرید" if legal_net > 0 else "خالص فروش"
+            legal_value = alert_money(estimate_trade_value_toman(abs(legal_net), last_price))
+            legal_parts.append(f"{legal_side} {alert_shares(abs(legal_net))} ≈ {legal_value}")
+        if legal_parts:
+            lines.append("حقوقی: " + " | ".join(legal_parts))
 
         buy_count = to_float(s.get("RealBuyCount"), 0)
         sell_count = to_float(s.get("RealSellCount"), 0)
@@ -3576,6 +3592,91 @@ def eod_late_reference(rows):
     return reference if last_sec-_hms_to_seconds(reference["captured_at"]) >= 180 else None
 
 
+def book_volume_at_price(book, price, side):
+    price_key, volume_key = ("pMeDem", "qTitMeDem") if side == "buy" else ("pMeOf", "qTitMeOf")
+    return sum(max(0, to_float(row.get(volume_key), row.get(f"{side}_volume", 0)))
+               for row in book if to_float(row.get(price_key), row.get(f"{side}_price", 0)) == price)
+
+
+def eod_previous_low_offer(conn, symbol, day):
+    """Use the previous traded session's closing book when it was recorded locally."""
+    prior = conn.execute("""SELECT * FROM daily WHERE symbol=? AND date<? AND volume>0
+        ORDER BY date DESC LIMIT 1""", (symbol, day)).fetchone()
+    if not prior or not prior["finalized"] or prior["last_price"] != prior["price_min"]:
+        return 0
+    price = prior["last_price"]
+    if price <= 0 or prior["price_yesterday"] <= 0 or pct_change(price, prior["price_yesterday"]) > -2:
+        return 0
+    rows = conn.execute("""SELECT * FROM best_limits_intraday WHERE symbol=? AND date=?
+        AND captured_at=(SELECT MAX(captured_at) FROM best_limits_intraday
+            WHERE symbol=? AND date=? AND captured_at>='12:25:00')""",
+                        (symbol, prior["date"], symbol, prior["date"])).fetchall()
+    offered = book_volume_at_price(map(dict, rows), price, "sell")
+    if offered >= max(ALERT_MIN_SHARES, 0.10 * prior["volume"]):
+        return offered
+    return 0
+
+
+def eod_headline(conn, symbol, day, summary, rows, book, bp):
+    last = summary["LastPrice"]
+    high, low, yesterday = (to_float(summary.get(key), 0) for key in ("High", "Low", "Yesterday"))
+    volume = summary["LiveVolume"]
+    ratio = to_float(summary.get("VolumeRatio20_Live"), 0)
+    day_pct = summary["LastChangePct"]
+    minimum_order = max(ALERT_MIN_SHARES, 0.10 * volume)
+    buy_at_high = book_volume_at_price(book, high, "buy") if last == high else 0
+    sell_at_low = book_volume_at_price(book, low, "sell") if last == low else 0
+    details = []
+    if buy_at_high:
+        details.append("سفارش خرید در سقف: " + alert_shares(buy_at_high))
+    if sell_at_low:
+        details.append("سفارش فروش در کف: " + alert_shares(sell_at_low))
+
+    if (yesterday > 0 and 0 < low <= 0.99 * yesterday and high > low
+            and last >= 1.01 * yesterday and last >= 0.998 * high):
+        details.insert(0, "کف روز: " + alert_ltr(fmt_price_pct(low, yesterday)))
+        if 0 < ratio <= 0.60:
+            return "برگشت از کف با حجم کمتر از معمول", details
+        return ("برگشت از کف تا سقف روز" if last == high else "برگشت از کف تا نزدیکی سقف روز"), details
+    if buy_at_high >= max(minimum_order, 0.25 * volume) and day_pct >= 2:
+        prior_offer = eod_previous_low_offer(conn, symbol, day)
+        if prior_offer:
+            details.insert(0, "عرضه در کف جلسهٔ قبل: " + alert_shares(prior_offer))
+            return "از عرضه در کف جلسهٔ قبل تا تقاضا در سقف", details
+        return "سفارش خرید پرحجم در سقف", details
+    has_offer = any(0 < to_float(row.get("pMeOf"), 0) <= high
+                    and to_float(row.get("qTitMeOf"), 0) > 0 for row in book)
+    if yesterday > 0 and high >= 1.02 * yesterday and last <= 0.99 * high and has_offer:
+        prior_queue = conn.execute("""SELECT 1 FROM best_limits_intraday WHERE symbol=? AND date=?
+            AND captured_at>='09:00:00' GROUP BY captured_at
+            HAVING MAX(sell_volume)=0 AND SUM(CASE WHEN buy_price=? THEN buy_volume ELSE 0 END)>=?
+            LIMIT 1""", (symbol, day, high, minimum_order)).fetchone()
+        if prior_queue:
+            details.insert(0, "سقف روز: " + alert_ltr(fmt_price_pct(high, yesterday)))
+            return "صف خرید باز شد و قیمت از سقف عقب نشست", details
+    if sell_at_low >= minimum_order and day_pct <= -2:
+        return "عرضه پرحجم در کف روز", details
+    if ratio >= 2:
+        return "حجم معاملات بالاتر از معمول", details
+    if ratio and ratio <= 0.60 and day_pct >= 1:
+        return "رشد قیمت با حجم کمتر از معمول", details
+    if rows and bp is not None:
+        first = rows[0]
+        first_bp = real_buyer_power(first["real_buy_volume"], first["real_sell_volume"],
+                                    first["real_buy_count"], first["real_sell_count"])
+        if first_bp and bp >= 1.20 and bp >= 1.25 * first_bp:
+            return "تقویت قدرت خریدار در طول روز", details
+        if first_bp and bp <= 0.85 and bp <= 0.80 * first_bp:
+            return "افت قدرت خریدار در طول روز", details
+    if bp is not None and bp <= 0.85:
+        return "سرانه فروش بالاتر از خرید", details
+    if bp is not None and bp >= 1.20:
+        return "سرانه خرید بالاتر از فروش", details
+    if day_pct > 0 and last == high:
+        return "پایان معاملات در سقف روز", details
+    return "مرور معاملات روز", details
+
+
 def build_channel_eod_text(conn, live_data, report_complete=True):
     """Factual Persian close commentary from collected prices, flows, BP and book.
 
@@ -3628,83 +3729,47 @@ def build_channel_eod_text(conn, live_data, report_complete=True):
                 summary.get("RealBuyCount"), summary.get("RealSellCount"),
             )
             rows = eod_client_history(conn, symbol, day)
-            lines = [f"{pct_emoji(day_pct)} {symbol_tag(symbol)}"]
+            book = [row for row in (live.get("best") or []) if isinstance(row, dict)]
+            headline, details = eod_headline(conn, symbol, day, summary, rows, book, bp)
+            lines = [f"{pct_emoji(day_pct)} {symbol_tag(symbol)} — {headline}"]
             lines.append("آخرین: " + alert_ltr(fmt_price_pct(last, pct=day_pct)))
             if close > 0 and close != last:
                 lines.append("پایانی: " + alert_ltr(fmt_price_pct(close, pct=summary.get("ClosingChangePct"))))
-            lines.append(eod_bp_history_line(rows, bp))
+
             ratio = summary.get("VolumeRatio20_Live")
-            activity = "حجم تفکیکی: " + alert_shares(volume)
+            activity = "حجم کل: " + alert_shares(volume)
             if ratio is not None:
-                activity += "؛ " + alert_ltr(f"{to_float(ratio, 0):.2f}") + " برابر میانگین۲۰"
-            lines.append(activity)
+                activity += "؛ " + alert_ltr(f"{ratio:.2f}") + " برابر میانگین ۲۰روزه"
+            lines.extend((activity, eod_bp_history_line(rows, bp)))
 
             real_net = to_float(summary.get("RealNetVolume"), 0)
-            if real_net != 0:
+            if real_net:
                 side = "ورود خالص حقیقی" if real_net > 0 else "خروج خالص حقیقی"
-                lines.append(f"{side}: {alert_shares(abs(real_net))} ≈ {alert_money(estimate_trade_value_toman(abs(real_net), last))}")
+                value = alert_money(estimate_trade_value_toman(abs(real_net), last))
+                lines.append(f"{side}: {alert_shares(abs(real_net))} ≈ {value}")
             legal_net = to_float(summary.get("LegalNetVolume"), 0)
-            if legal_net > 0:
-                lines.append("حقوقی‌ها خریدار خالص روز بودند.")
-            elif legal_net < 0:
-                lines.append("حقوقی‌ها فروشنده خالص روز بودند.")
-
-            comments = []
-            high = to_float(summary.get("High"), 0)
-            retreat = pct_change(last, high) if high > 0 else 0
-            if high > 0 and retreat <= -1.0:
-                comments.append(f"آخرین قیمت {alert_ltr(f'{abs(retreat):.2f}%')} پایین‌تر از سقف روز قرار گرفت.")
-            elif high > 0 and day_pct > 0 and retreat >= -0.2:
-                comments.append("قیمت نزدیک سقف روز حفظ شد.")
-            if bp is not None:
-                if 0.95 <= bp <= 1.05:
-                    comments.append("سرانه خرید و فروش تقریباً برابر شد.")
-                elif bp > 1.05:
-                    comments.append("سرانه خریدار بزرگ‌تر از فروشنده بود.")
-                else:
-                    comments.append("سرانه فروشنده بزرگ‌تر از خریدار بود.")
+            if legal_net:
+                side = "خریدار" if legal_net > 0 else "فروشنده"
+                lines.append(f"حقوقی‌ها {side} خالص روز بودند.")
 
             reference = eod_late_reference(rows)
-            if reference:
-                old_bp = real_buyer_power(
-                    reference.get("real_buy_volume"), reference.get("real_sell_volume"),
-                    reference.get("real_buy_count"), reference.get("real_sell_count"),
-                )
-                if bp is not None and old_bp is not None and abs(pct_change(bp, old_bp)) >= 10:
-                    direction = "تقویت" if bp > old_bp else "تضعیف"
-                    comments.append(f"قدرت خریدار نسبت به ساعت {alert_ltr(reference['captured_at'][:5])} {direction} شد.")
-                counters_valid = (
-                    to_float(summary.get("RealBuyVolume"), 0) >= to_float(reference.get("real_buy_volume"), 0)
-                    and to_float(summary.get("RealSellVolume"), 0) >= to_float(reference.get("real_sell_volume"), 0)
-                )
-                late_net = real_net-to_float(reference.get("real_net_volume"), 0)
-                if counters_valid and abs(late_net) >= ALERT_MIN_SHARES:
-                    side = "خرید" if late_net > 0 else "فروش"
-                    comments.append(f"از ساعت {alert_ltr(reference['captured_at'][:5])} خالص {side} حقیقی {alert_shares(abs(late_net))} ثبت شد.")
+            if reference and all(rows[-1].get(key) == summary.get(column) for key, column in (
+                ("real_buy_volume", "RealBuyVolume"), ("real_sell_volume", "RealSellVolume")
+            )):
+                late = client_interval(rows[-1], reference)
+                if late:
+                    late_net = late["real_buy_volume"] - late["real_sell_volume"]
+                    if late_net != real_net and abs(late_net) >= max(ALERT_MIN_SHARES, 0.05 * volume):
+                        side = "خرید" if late_net > 0 else "فروش"
+                        clock = alert_ltr(reference["captured_at"][:5])
+                        details.append(f"خالص {side} حقیقی از {clock}: {alert_shares(abs(late_net))}")
 
-            book = [row for row in live.get("best", []) if isinstance(row, dict)]
-            buy_at_last = sum(max(0, to_float(r.get("qTitMeDem"), r.get("buy_volume", 0)))
-                              for r in book if to_float(r.get("pMeDem"), r.get("buy_price", 0)) == last)
-            sell_at_last = sum(max(0, to_float(r.get("qTitMeOf"), r.get("sell_volume", 0)))
-                               for r in book if to_float(r.get("pMeOf"), r.get("sell_price", 0)) == last)
-            low = to_float(summary.get("Low"), 0)
-            if last == high and buy_at_last > 0:
-                comments.append("تقاضای نمایان در سقف: " + alert_shares(buy_at_last) + ".")
-            elif last == low and sell_at_last > 0:
-                comments.append("عرضه نمایان در کف: " + alert_shares(sell_at_last) + ".")
-            rsi = summary.get("RSI14")
-            sma20 = to_float(summary.get("SMA20"), 0)
-            if rsi is not None and to_float(rsi, 0) >= 80:
-                comments.append("RSI بالا: " + alert_ltr(f"{to_float(rsi, 0):.1f}") + ".")
-            elif sma20 > 0 and close < sma20:
-                comments.append("پایانی هنوز زیر میانگین۲۰روزه است.")
-            if comments:
-                lines.insert(1, " ".join(comments))
+            lines.extend(details)
             sections.append("\n".join(lines))
         except Exception as exc:
             print(f"EOD commentary unavailable for {symbol_tag(symbol)}: {exc}")
             sections.append(f"▪️ {symbol_tag(symbol)}: داده کافی برای جمع‌بندی موجود نیست.")
-    sections.append("قیمت‌ها ریال؛ حجم از آمار تفکیکی و ارزش‌ها برآورد با قیمت آخر است.")
+    sections.append("قیمت‌ها به ریال‌اند و ارزش‌ها با قیمت آخر برآورد شده‌اند.")
     return "\n\n".join(sections)
 
 
