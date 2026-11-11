@@ -59,6 +59,15 @@ Revision 2026-11-11.2:
   - Phase crossings need both 1% of comparable prior-20-session volume and 50m toman.
   - Retry failed deliveries without consuming channel coverage. First activation
     starts at current counters; restarts retain that boundary and delivery history.
+
+Revision 2026-11-11.3 (B14/B15 only):
+  - Price alerts require new official executions and positive, matched ClientType
+    volume in their own window. Repeated/corrected packets cannot trigger them.
+  - Price momentum titles describe price, independently of participant power/flow.
+  - Keep a 30-second short price window even when SNAPSHOT_SECONDS=15 is tested;
+    the default poll remains 30 seconds. Long collection gaps are not sudden moves.
+  - FEED_FRESHNESS measures observed packet changes, repeats and actual poll gaps;
+    these observations do not establish the exchange's internal refresh period.
 """
 
 import csv
@@ -92,7 +101,7 @@ COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
 EXPORT_HISTORY_SHEETS = os.getenv("TSETMC_EXPORT_HISTORY", "0") == "1"
-COLLECTOR_VERSION = "2026-11-11.2"
+COLLECTOR_VERSION = "2026-11-11.3"
 PHASE_MIN_VOLUME_FRACTION = 0.01
 PHASE_MIN_VALUE_TOMAN = 50_000_000
 
@@ -106,6 +115,7 @@ REAL_FLOW_NOTICE_TOMAN = 200_000_000
 REAL_FLOW_HEAVY_TOMAN = 500_000_000
 SMALL_BUY_MIN_AVERAGE_TOMAN = 150_000_000
 SUDDEN_PRICE_PCT_30S = max(0.1, float(os.getenv("SUDDEN_PRICE_PCT_30S", "0.60")))
+SUDDEN_PRICE_WINDOW_SECONDS = 30  # Independent of the optional 15-second poll.
 # Multi-minute momentum alert: catches step-by-step aggressive buying/selling that a
 # single 30-second jump can miss (e.g. a 2% rise spread over ~4 minutes).
 MOMENTUM_MIN_SECONDS = max(60, int(os.getenv("MOMENTUM_MIN_SECONDS", "180")))
@@ -1075,7 +1085,11 @@ def _hms_to_seconds(value):
         return None
 
 
-def _seconds_to_hms(value):
+def _seconds_to_hms(value, precise=False):
+    if precise:
+        total = max(0, min(86_400_000_000-1, round(value*1_000_000)))
+        seconds, micros = divmod(total, 1_000_000)
+        return _seconds_to_hms(seconds) + f".{micros:06d}"
     value = max(0, min(86399, int(value)))
     hh, rem = divmod(value, 3600)
     mm, ss = divmod(rem, 60)
@@ -1090,6 +1104,16 @@ def momentum_reference_snapshot(conn, symbol, date_value, captured_at, kind="cli
     return alert_sample(conn, symbol, date_value, kind,
                         lower=_seconds_to_hms(seconds-MOMENTUM_MAX_SECONDS),
                         upper=_seconds_to_hms(seconds-MOMENTUM_MIN_SECONDS), oldest=True)
+
+
+def short_price_reference(conn, symbol, day, captured_at):
+    """Use at least 30 seconds, allowing at most one poll of sampling slippage."""
+    seconds = _hms_to_seconds(captured_at)
+    if seconds is None or seconds < SUDDEN_PRICE_WINDOW_SECONDS:
+        return None
+    return alert_sample(conn, symbol, day, "price",
+                        lower=_seconds_to_hms(seconds-SUDDEN_PRICE_WINDOW_SECONDS-max(5, SNAPSHOT_SECONDS), precise=True),
+                        upper=_seconds_to_hms(seconds-SUDDEN_PRICE_WINDOW_SECONDS, precise=True))
 
 
 def latest_30s_delta(conn, symbol, date_value):
@@ -1448,6 +1472,42 @@ def current_has_trades(current):
             and to_float(current.get("pDrCotVal"), 0) > 0 and market_time >= TRADING_START_HHMMSS)
 
 
+def price_observation(current, captured_at):
+    count = to_float(current.get("zTotTran"), float("nan"))
+    return dict(captured_at=captured_at,
+                volume=to_float(current.get("qTotTran5J"), 0),
+                last_price=to_float(current.get("pDrCotVal"), 0),
+                market_time=to_int(current.get("hEven") or current.get("lastHEven"), 0),
+                trades=count if math.isfinite(count) and count >= 0 else None)
+
+
+def has_new_execution(current, previous):
+    """Receipt/book changes are not executions; volume must strictly increase.
+
+    Use a trade-count increase too when both packets carry that counter. Multiple
+    executions in the same market second are valid; clock regression is not.
+    """
+    if not previous or current["captured_at"] <= previous["captured_at"]:
+        return False
+    if not all(math.isfinite(to_float(packet.get(key), float("nan")))
+               for packet in (current, previous) for key in ("volume", "last_price")):
+        return False
+    if (current["market_time"] < max(TRADING_START_HHMMSS, previous.get("market_time", 0))
+            or current["volume"] <= previous["volume"] or current["last_price"] <= 0):
+        return False
+    count, old_count = current.get("trades"), previous.get("trades")
+    return count is None or old_count is None or count > old_count
+
+
+def price_window_has_volume(conn, symbol, day, reference, observation, sample, minimum):
+    """Missing/unchanged/corrected classification never passes a price-volume gate."""
+    if not reference or not has_new_execution(observation, reference):
+        return False
+    client_ref = client_reference_for_price(conn, symbol, day, reference, sample)
+    change = client_interval(sample, client_ref)
+    return bool(change and change["classified_volume"] >= max(1, minimum))
+
+
 def is_preopen(captured_at):
     seconds = _hms_to_seconds(captured_at)
     return seconds is not None and 8 * 3600 + 45 * 60 <= seconds < 9 * 3600
@@ -1758,8 +1818,8 @@ def detect_fast_alerts(conn, live, captured_at):
     threshold = alert_threshold_shares(conn, symbol, date_value=date_value)
     flow_candidates = []
     price_candidates = []
-    observation = dict(captured_at=price_at, volume=official_volume,
-                       last_price=last_price, market_time=market_time)
+    observation = price_observation(current, price_at)
+    fresh_execution = trading_active and has_new_execution(observation, prev)
     # A first activation starts here, even when an old collector populated this DB.
     floor_key = f"coverage_price_floor:{date_value}:{symbol}"
     if trading_active and not meta_get(conn, floor_key):
@@ -1839,14 +1899,19 @@ def detect_fast_alerts(conn, live, captured_at):
             alerts.append(format_market_alert(f"{pct_emoji(opening_pct)} گشایش {direction}",
                                              symbol, price_at, ["\n".join(lines)]))
         meta_set(conn, opening_key, "1")
-    elif price_valid and previous_price:
-        fresh_ref = fresh_price_reference(conn, symbol, date_value, previous_price, observation)
-        previous_last = fresh_ref["last_price"]
+    elif price_valid and previous_price and fresh_execution:
+        short_ref = short_price_reference(conn, symbol, date_value, price_at)
+        fresh_ref = fresh_price_reference(conn, symbol, date_value, short_ref, observation) if short_ref else None
+        short_age = (_hms_to_seconds(price_at)-_hms_to_seconds(fresh_ref["captured_at"])) if fresh_ref else 0
+        if short_age < SUDDEN_PRICE_WINDOW_SECONDS:
+            fresh_ref = None
+        previous_last = fresh_ref["last_price"] if fresh_ref else last_price
         last_pct = pct_change(last_price, price_yesterday)
         previous_pct = pct_change(previous_last, price_yesterday)
         move = pct_change(last_price, previous_last)
-        volume_ok = change is None or change["classified_volume"] == 0 or change["classified_volume"] >= max(50_000, threshold*.35)
-        if abs(move) >= SUDDEN_PRICE_PCT_30S and volume_ok:
+        short_volume_ok = price_window_has_volume(conn, symbol, date_value, fresh_ref, observation,
+                                                  sample, max(50_000, threshold*.35))
+        if abs(move) >= SUDDEN_PRICE_PCT_30S and short_volume_ok:
             up = move > 0
             key = "priceup" if up else "pricedown"
             if alert_allowed(conn, f"{symbol}:{key}"):
@@ -1855,27 +1920,26 @@ def detect_fast_alerts(conn, live, captured_at):
         price_ref = momentum_reference_snapshot(conn, symbol, date_value, price_at, kind="price")
         if price_ref:
             price_ref = fresh_price_reference(conn, symbol, date_value, price_ref, observation)
-            client_ref = client_reference_for_price(conn, symbol, date_value, price_ref, sample)
-            momentum_change = client_interval(sample, client_ref)
-            volume = momentum_change["classified_volume"] if momentum_change else None
             movement = pct_change(last_price, price_ref["last_price"])
             ref_pct = pct_change(price_ref["last_price"], price_yesterday)
             momentum_threshold = alert_threshold_shares(conn, symbol, MOMENTUM_DAILY_VOLUME_FRACTION, date_value)
-            volume_ok = volume is None or volume == 0 or volume >= momentum_threshold
+            volume_ok = price_window_has_volume(conn, symbol, date_value, price_ref, observation,
+                                                sample, momentum_threshold)
             if abs(movement) >= MOMENTUM_PRICE_PCT and volume_ok:
                 up = movement > 0
                 key = "momentumup" if up else "momentumdown"
                 if alert_allowed(conn, f"{symbol}:{key}", MOMENTUM_ALERT_COOLDOWN_SECONDS):
-                    title = ("🟢 تقویت مثبت / خرید رو به بالا" if ref_pct > 0 and last_pct > 0
-                             else "📈 خرید رو به بالا / مومنتوم مثبت") if up else "📉 فروش رو به پایین / مومنتوم منفی"
+                    title = ("🟢 تقویت رشد قیمت / مومنتوم مثبت" if ref_pct > 0 and last_pct > 0
+                             else "📈 رشد قیمت / مومنتوم مثبت") if up else "📉 افت قیمت / مومنتوم منفی"
                     price_candidates.append(dict(title=title, reference=price_ref, direction=up, priority=1))
             strengthen_threshold = alert_threshold_shares(conn, symbol, POSITIVE_STRENGTHEN_VOLUME_FRACTION, date_value)
             if (ref_pct > 0 and last_pct > 0 and last_pct-ref_pct >= POSITIVE_STRENGTHEN_PCT
                     and movement < MOMENTUM_PRICE_PCT
-                    and (volume is None or volume == 0 or volume >= strengthen_threshold)
+                    and price_window_has_volume(conn, symbol, date_value, price_ref, observation,
+                                                sample, strengthen_threshold)
                     and alert_allowed(conn, f"{symbol}:positive_strengthen", POSITIVE_STRENGTHEN_COOLDOWN_SECONDS)):
-                price_candidates.append(dict(title="🟢 تقویت مثبت", reference=price_ref, direction=True, priority=1))
-        if phase_volume_allowed(conn, symbol, date_value, fresh_ref, sample, last_price):
+                price_candidates.append(dict(title="🟢 تقویت رشد قیمت", reference=price_ref, direction=True, priority=1))
+        if fresh_ref and short_volume_ok and phase_volume_allowed(conn, symbol, date_value, fresh_ref, sample, last_price):
             if previous_pct <= 0 < last_pct and last_pct-previous_pct >= .40:
                 if alert_allowed(conn, f"{symbol}:turnedgreen"):
                     price_candidates.append(dict(title="🟢 تغییر فاز به مثبت", reference=fresh_ref, direction=True, priority=3))
@@ -1884,8 +1948,6 @@ def detect_fast_alerts(conn, live, captured_at):
                     price_candidates.append(dict(title="🔴 تغییر فاز به منفی", reference=fresh_ref, direction=False, priority=3))
 
     alerts.extend(compose_market_reports(conn, live, flow_candidates, price_candidates, observation, sample))
-    observation = dict(captured_at=price_at, volume=official_volume,
-                       last_price=last_price, market_time=market_time)
     if price_valid:
         save_alert_sample(conn, symbol, date_value, "price", observation)
     # Store raw official observations separately, solely for order-execution estimates.
@@ -3629,6 +3691,7 @@ def write_readme(wb):
         ("PV_5M_TODAY", "Today's real TSETMC trade-price path in 5-minute buckets (TradeHistory/TradeIntraDay)."),
         ("PV_QUALITY", "Intraday price-path quality; official daily volume still comes from ClosingPriceInfo."),
         ("CLIENT_INTRADAY", "Raw endpoint receipt times and source; volume=official, classified_volume=one ClientType side. Missing/stale packets carry quality flags."),
+        ("FEED_FRESHNESS", "Fast-only PRICE/CLIENT/BOOK packet changes/repeats and actual receipt gaps. Observed change gaps include polling/network/trading inactivity; they are NOT the exchange's internal refresh period. Default polling remains 30s; SNAPSHOT_SECONDS=15 is optional, with price alerts still using a 30s window plus at most one poll of sampling slippage."),
         ("CLIENT_CURRENT", "Current real/legal participation."),
         ("BEST_LIMITS", "Current top bid/ask levels."),
         ("BEST_LIMITS_INTRADAY", "30-second order-book history for cancellation/movement analysis."),
@@ -3737,6 +3800,7 @@ def build_output(conn, live_data, output_path, market_indices=None, index_histor
     market_dates = [d for d in market_dates if d]
     client_intraday = get_client_intraday_rows(conn, max(market_dates) if market_dates else None)
     write_sheet(wb, "CLIENT_INTRADAY", client_intraday)
+    write_sheet(wb, "FEED_FRESHNESS", feed_freshness_rows(conn, max(market_dates) if market_dates else 0))
 
     best_intraday = get_best_limits_intraday_rows(conn, max(market_dates) if market_dates else None)
     write_sheet(wb, "BEST_LIMITS_INTRADAY", best_intraday)
@@ -4284,6 +4348,7 @@ def collect_fast_symbol(conn, symbol):
 
     best = []
     book_received_at = None
+    book_request_ok = False
     if FETCH_BEST_LIMITS:
         p = api_get(
             f"BestLimits/{inscode}",
@@ -4292,6 +4357,7 @@ def collect_fast_symbol(conn, symbol):
         )
         best = unwrap_list(p, ("bestLimits",))
         book_received_at = received_clock()
+        book_request_ok = p is not None
         for r in best:
             if isinstance(r, dict):
                 r["Symbol"] = symbol
@@ -4299,6 +4365,7 @@ def collect_fast_symbol(conn, symbol):
     return {
         "symbol": symbol,
         "capture_source": "fast",
+        "book_request_ok": book_request_ok,
         "price_received_at": price_received_at,
         "client_received_at": client_received_at,
         "book_received_at": book_received_at,
@@ -4314,11 +4381,112 @@ def collect_fast_symbol(conn, symbol):
     }
 
 
+def record_feed_freshness(conn, live):
+    """Passive Fast-only observations, not an estimate of internal server cadence.
+
+    Endpoint receipt clocks and packet contents are measured separately. Each
+    endpoint has its own state; order-book changes are never counted as trades.
+    """
+    if live.get("capture_source") != "fast":
+        return
+    symbol = live.get("symbol") or "?"
+    current = live.get("current") or {}
+    day = to_int(current.get("dEven"), 0)
+    if day != int(tehran_now().strftime("%Y%m%d")):
+        return
+    price = price_observation(current, live.get("price_received_at"))
+    client = client_snapshot(live)
+    book_fields = ("number", "pMeDem", "qTitMeDem", "zOrdMeDem", "pMeOf", "qTitMeOf", "zOrdMeOf")
+    book = sorted([to_float(row.get(k), 0) for k in book_fields]
+                  for row in live.get("best") or [] if isinstance(row, dict))
+    feeds = (
+        ("PRICE", live.get("price_received_at"), price,
+         "qTotTran5J" in current and "pDrCotVal" in current),
+        ("CLIENT", live.get("client_received_at"), {k: client[k] for k in CLIENT_FIELDS},
+         client["status"] in ("READY", "EMPTY")),
+        ("BOOK", live.get("book_received_at"), book, live.get("book_request_ok", bool(book))),
+    )
+    for feed, receipt, packet, valid in feeds:
+        seconds = _hms_to_seconds(receipt)
+        if seconds is None:
+            continue
+        key = f"feed_freshness:{day}:{symbol}:{feed}"
+        stats = json.loads(meta_get(conn, key, "{}"))
+        previous_receipt = stats.get("last_receipt")
+        if previous_receipt and receipt <= previous_receipt:
+            continue
+        stats["polls"] = stats.get("polls", 0) + 1
+        if previous_receipt:
+            stats["poll_gap_total"] = stats.get("poll_gap_total", 0) + seconds-_hms_to_seconds(previous_receipt)
+            stats["poll_gaps"] = stats.get("poll_gaps", 0) + 1
+        stats.setdefault("first_receipt", receipt)
+        stats["last_receipt"] = receipt
+        # Invalid numeric packets are counted, without allowing NaN into stored JSON.
+        try:
+            comparable = {k: v for k, v in packet.items() if k != "captured_at"} if isinstance(packet, dict) else packet
+            fingerprint = json.dumps(comparable, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError):
+            valid, fingerprint = False, None
+        if not valid:
+            stats["invalid_packets"] = stats.get("invalid_packets", 0) + 1
+            stats["state"] = "INVALID"
+        else:
+            previous = stats.get("last_packet")
+            same = fingerprint == stats.get("fingerprint")
+            stats["state"] = "FIRST" if previous is None else "UNCHANGED" if same else "CHANGED"
+            if previous is not None:
+                field_names = ("volume", "market_time", "trades") if feed == "PRICE" else tuple(CLIENT_FIELDS) if feed == "CLIENT" else ()
+                regressed = any(packet.get(k) is not None and previous.get(k) is not None
+                                and packet[k] < previous[k] for k in field_names)
+                if regressed:
+                    stats["state"] = "COUNTER_ROLLBACK"
+                    stats["regressed_packets"] = stats.get("regressed_packets", 0) + 1
+                counter = "repeated_packets" if same else "changed_packets"
+                stats[counter] = stats.get(counter, 0) + 1
+                new_trade = has_new_execution(packet, previous) if feed == "PRICE" else (
+                    not regressed and sum(packet[k] for k in ("real_buy_volume", "legal_buy_volume")) >
+                    sum(previous[k] for k in ("real_buy_volume", "legal_buy_volume"))) if feed == "CLIENT" else False
+                stats["trade_updates"] = stats.get("trade_updates", 0) + int(new_trade)
+            if not same:
+                if stats.get("last_change"):
+                    gap = seconds-_hms_to_seconds(stats["last_change"])
+                    stats["change_gap_total"] = stats.get("change_gap_total", 0) + gap
+                    stats["change_gaps"] = stats.get("change_gaps", 0) + 1
+                    stats["min_change_gap"] = min(stats.get("min_change_gap", gap), gap)
+                stats["last_change"] = receipt
+            stats["fingerprint"] = fingerprint
+            stats["last_packet"] = packet
+        meta_set(conn, key, json.dumps(stats, ensure_ascii=False, allow_nan=False))
+
+
+def feed_freshness_rows(conn, day):
+    rows = []
+    for symbol in SYMBOLS:
+        for feed in ("PRICE", "CLIENT", "BOOK"):
+            stats = json.loads(meta_get(conn, f"feed_freshness:{day}:{symbol}:{feed}", "{}"))
+            if not stats:
+                continue
+            comparisons = stats.get("changed_packets", 0) + stats.get("repeated_packets", 0)
+            rows.append(dict(Symbol=symbol, Date=day, Feed=feed, LastState=stats["state"],
+                Polls=stats["polls"], ChangedPackets=stats.get("changed_packets", 0),
+                RepeatedPackets=stats.get("repeated_packets", 0),
+                RepeatedPct=round(100*stats.get("repeated_packets", 0)/comparisons, 2) if comparisons else None,
+                RegressedPackets=stats.get("regressed_packets", 0), InvalidPackets=stats.get("invalid_packets", 0),
+                TradeUpdates=stats.get("trade_updates", 0) if feed != "BOOK" else None,
+                ConfiguredPollSeconds=SNAPSHOT_SECONDS,
+                MeanPollGapSeconds=round(stats["poll_gap_total"]/stats["poll_gaps"], 3) if stats.get("poll_gaps") else None,
+                MeanObservedChangeGapSeconds=round(stats["change_gap_total"]/stats["change_gaps"], 3) if stats.get("change_gaps") else None,
+                MinObservedChangeGapSeconds=round(stats["min_change_gap"], 3) if stats.get("change_gaps") else None,
+                FirstReceiptAt=stats["first_receipt"], LastReceiptAt=stats["last_receipt"],
+                LastObservedChangeAt=stats.get("last_change")))
+    return rows
+
+
 def run_fast_snapshot(conn):
-    """Collect only the fast-changing fields. Designed for ~30-second cadence."""
+    """Collect fast-changing fields at SNAPSHOT_SECONDS; default 30, optional 15."""
     global API_STATUS
     API_STATUS = []
-    started = time.time()
+    started = time.monotonic()
     live_data = []
     retry_market_outbox(conn)
 
@@ -4328,10 +4496,11 @@ def run_fast_snapshot(conn):
             live_data.append(live)
             captured_at = live.get("client_received_at") or received_clock()
 
-            # Compare against the previous 30-second snapshot before persisting the current one.
+            # Price alert windows remain 30 seconds even with faster polling.
             for alert_text in detect_fast_alerts(conn, live, captured_at):
                 deliver_market_alert(conn, alert_text)
 
+            record_feed_freshness(conn, live)
             save_client_intraday(conn, live, captured_at=captured_at)
             save_best_limits_intraday(conn, live)
         except Exception as e:
@@ -4346,7 +4515,10 @@ def run_fast_snapshot(conn):
                 "Error": str(e),
             })
 
-    print(f"Fast snapshot complete in {time.time()-started:.1f}s ({len(live_data)}/{len(SYMBOLS)} symbols)")
+    elapsed = time.monotonic()-started
+    print(f"Fast snapshot complete in {elapsed:.1f}s ({len(live_data)}/{len(SYMBOLS)} symbols)")
+    if elapsed > SNAPSHOT_SECONDS:
+        print(f"Fast cycle exceeded its {SNAPSHOT_SECONDS}s target; inspect FEED_FRESHNESS for actual receipt gaps.")
     return live_data
 
 
@@ -4453,7 +4625,7 @@ def heavy_worker(stop_event, report_state, report_lock):
 
 def collector_main():
     print("=" * 58)
-    print(f"TSETMC AUTOMATIC COLLECTOR {COLLECTOR_VERSION} — FAST 30s / HEAVY 5m")
+    print(f"TSETMC AUTOMATIC COLLECTOR {COLLECTOR_VERSION} — FAST {SNAPSHOT_SECONDS}s / HEAVY {HEAVY_REFRESH_SECONDS}s")
     print("=" * 58)
     print("Local DB:", DB_PATH)
     print("Iran proxies configured:", len(TSETMC_PROXIES))
@@ -4474,7 +4646,7 @@ def collector_main():
 
         old, offset = telegram_get_updates(None)
         print(f"Telegram ready; ignored {len(old)} old update(s).")
-        telegram_send_message("✅ Collector آماده است؛ Fast و سفارش‌ها هر ۳۰ ثانیه، Heavy هر ۵ دقیقه، هشدار خرید/فروش درشت، جهش قیمت، صف و حذف سفارش فعال است.")
+        telegram_send_message(f"✅ Collector آماده است؛ Fast و سفارش‌ها هر {SNAPSHOT_SECONDS} ثانیه، Heavy هر {HEAVY_REFRESH_SECONDS} ثانیه، پنجرهٔ هشدار قیمت ۳۰ ثانیه؛ سنجش تازگی داده فعال است.")
 
         now = tehran_now()
         if hhmmss(now) < MARKET_START_HHMMSS:
@@ -4502,7 +4674,7 @@ def collector_main():
                 heavy_thread.start()
 
             # Fast snapshot cadence is measured from cycle start, not cycle end.
-            now_ts = time.time()
+            now_ts = time.monotonic()
             if now_ts - last_fast_time >= SNAPSHOT_SECONDS:
                 last_fast_time = now_ts
                 try:
@@ -4511,7 +4683,7 @@ def collector_main():
                     print("Fast cycle failed:", e)
                     telegram_send_message(f"هشدار Fast Collector: {e}")
 
-            # Poll Telegram frequently, independent of 30-second market snapshots.
+            # Poll Telegram independently of the configured market snapshot interval.
             offset, live_data = handle_telegram_commands(conn, live_data, offset, report_state)
             time.sleep(2)
 
