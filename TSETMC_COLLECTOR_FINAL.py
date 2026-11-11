@@ -42,9 +42,27 @@ Alert volume and published daily volume use one matched ClientType side
 updates, not individual execution times. Official volume remains archived
 for diagnostics and order-cancellation estimates. Fast alert baselines are
 isolated from Heavy collection; the existing local database upgrades in place.
+
+Revision 2026-11-11.1:
+  - Real flow: 200-500m toman = notable; over 500m = heavy, per side.
+    Below 200m purchases require at least 150m estimated value per new buyer.
+  - Significant sell-order additions outside existing queue states.
+  - Persistent shares/event timeline normalizes prior positive-volume sessions
+    to current capital; actual traded volume is never rescaled in messages.
+  - Preopening book alerts are labeled; trading alerts start at 09:00.
+  - Channel close reports are sent separately for each symbol, in watchlist order.
+
+Revision 2026-11-11.2:
+  - Persist successful per-recipient deliveries and subtract their exact ClientType
+    intervals from later windows; averages use only the remaining intervals.
+  - Combine simultaneous price reasons; later momentum starts after reported moves.
+  - Phase crossings need both 1% of comparable prior-20-session volume and 50m toman.
+  - Retry failed deliveries without consuming channel coverage. First activation
+    starts at current counters; restarts retain that boundary and delivery history.
 """
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -74,6 +92,9 @@ COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
 EXPORT_HISTORY_SHEETS = os.getenv("TSETMC_EXPORT_HISTORY", "0") == "1"
+COLLECTOR_VERSION = "2026-11-11.2"
+PHASE_MIN_VOLUME_FRACTION = 0.01
+PHASE_MIN_VALUE_TOMAN = 50_000_000
 
 # Fast alerts: intentionally conservative to avoid Telegram spam.
 ALERT_COOLDOWN_SECONDS = max(30, int(os.getenv("ALERT_COOLDOWN_SECONDS", "180")))
@@ -81,6 +102,9 @@ ALERT_MIN_SHARES = max(1, int(os.getenv("ALERT_MIN_SHARES", "200000")))
 ALERT_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("ALERT_DAILY_VOLUME_FRACTION", "0.03")))
 ORDER_ALERT_DAILY_VOLUME_FRACTION = max(0.001, float(os.getenv("ORDER_ALERT_DAILY_VOLUME_FRACTION", "0.05")))
 CONCENTRATED_MAX_NEW_PEOPLE = max(1, int(os.getenv("CONCENTRATED_MAX_NEW_PEOPLE", "4")))
+REAL_FLOW_NOTICE_TOMAN = 200_000_000
+REAL_FLOW_HEAVY_TOMAN = 500_000_000
+SMALL_BUY_MIN_AVERAGE_TOMAN = 150_000_000
 SUDDEN_PRICE_PCT_30S = max(0.1, float(os.getenv("SUDDEN_PRICE_PCT_30S", "0.60")))
 # Multi-minute momentum alert: catches step-by-step aggressive buying/selling that a
 # single 30-second jump can miss (e.g. a 2% rise spread over ~4 minutes).
@@ -171,6 +195,7 @@ DAILY_CONTEXT_DAYS = 260
 # Intraday aggregation.
 INTRADAY_BUCKET_MINUTES = 5
 MARKET_START_HHMMSS = 84500
+TRADING_START_HHMMSS = 90000
 MARKET_END_HHMMSS = 123000
 
 # Slow-changing/current extras are cached to make repeated intraday runs fast.
@@ -574,6 +599,20 @@ def connect_db():
     """)
     conn.execute("""CREATE INDEX IF NOT EXISTS alert_samples_lookup
                     ON alert_samples(symbol,date,kind,captured_at)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS instrument_shares (
+        inscode TEXT NOT NULL, date INTEGER NOT NULL, shares REAL NOT NULL,
+        PRIMARY KEY(inscode,date))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS instrument_share_changes (
+        inscode TEXT NOT NULL, date INTEGER NOT NULL,
+        old_shares REAL NOT NULL, new_shares REAL NOT NULL,
+        PRIMARY KEY(inscode,date,old_shares,new_shares))""")
+    for table in ("market_alert_receipts", "market_alert_outbox"):
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS {table} (
+            target TEXT NOT NULL, report_id TEXT NOT NULL, symbol TEXT NOT NULL,
+            date INTEGER NOT NULL, text TEXT NOT NULL, payload TEXT NOT NULL,
+            created REAL NOT NULL, PRIMARY KEY(target,report_id))""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS market_receipts_lookup
+                    ON market_alert_receipts(target,symbol,date,created)""")
     conn.commit()
     return conn
 
@@ -832,10 +871,94 @@ def published_client_snapshot(conn, live):
     return sample if sample["ready"] else None
 
 
+def store_share_changes(conn, inscode, changes):
+    """Persist the dated share timeline; duplicate API events cannot compound it."""
+    for row in changes:
+        if not isinstance(row, dict):
+            continue
+        day = to_int(row.get("dEven"), 0)
+        old = to_float(row.get("numberOfShareOld"), 0)
+        new = to_float(row.get("numberOfShareNew"), 0)
+        if 19000101 <= day <= 29991231 and all(math.isfinite(x) and x > 0 for x in (old, new)):
+            conn.execute("INSERT OR IGNORE INTO instrument_share_changes VALUES(?,?,?,?)",
+                         (str(inscode), day, old, new))
+    conn.commit()
+
+
+def refresh_share_context(conn, symbol, inscode, current):
+    """Check each session and the first traded packet; recheck on Heavy refreshes.
+
+    Only actual share-count changes affect volume. Dividend/price factors never do.
+    Failed requests retain the saved timeline and retry after a short cache delay.
+    """
+    day = int(tehran_now().strftime("%Y%m%d"))
+    phase = "traded" if current_has_trades(current) else "before_trade"
+    key = f"share_check:{inscode}:{day}:{phase}"
+    if cache_get(conn, key, 15) is not None:
+        return
+    if cache_get(conn, f"share_retry:{inscode}", 1) is not None:
+        return
+    cache_set(conn, f"share_retry:{inscode}", True)
+    payload = api_get(f"Instrument/GetInstrumentInfo/{inscode}", symbol, "InstrumentShares")
+    info = unwrap_dict(payload, ("instrumentInfo",))
+    shares = to_float(info.get("zTitad"), 0)
+    previous = conn.execute("SELECT shares FROM instrument_shares WHERE inscode=? ORDER BY date DESC LIMIT 1",
+                            (str(inscode),)).fetchone()
+    changed = shares > 0 and previous is not None and shares != previous["shares"]
+    history_key = f"share_events:{inscode}:{day}"
+    events_ok = cache_get(conn, history_key, 24 * 60) is not None
+    if changed or not events_ok:
+        events_ok = False
+        if changed:
+            conn.execute("DELETE FROM cache WHERE cache_key=?", (history_key,))
+            conn.commit()
+        events_payload = api_get(f"Instrument/GetInstrumentShareChange/{inscode}", symbol, "ShareChangeHistory")
+        # An empty successful list is valid; a failed request is not a valid empty history.
+        if isinstance(events_payload, list) or (isinstance(events_payload, dict)
+                                               and isinstance(events_payload.get("instrumentShareChange"), list)):
+            store_share_changes(conn, inscode, unwrap_list(events_payload, ("instrumentShareChange",)))
+            cache_set(conn, history_key, True)
+            events_ok = True
+    if math.isfinite(shares) and shares > 0:
+        conn.execute("INSERT OR REPLACE INTO instrument_shares VALUES(?,?,?)", (str(inscode), day, shares))
+        conn.commit()
+        if events_ok:
+            cache_set(conn, key, True)
+
+
+def share_count_on_date(conn, inscode, day):
+    """Dated step function, including old capital before the first known event."""
+    if not inscode:
+        return None
+    events = conn.execute("SELECT date,old_shares,new_shares FROM instrument_share_changes WHERE inscode=? ORDER BY date,old_shares",
+                          (str(inscode),)).fetchall()
+    anchors = [(r["date"], r["new_shares"]) for r in events if r["date"] <= day]
+    observed = conn.execute("SELECT date,shares FROM instrument_shares WHERE inscode=? AND date<=? ORDER BY date DESC LIMIT 1",
+                            (str(inscode), day)).fetchone()
+    if observed:
+        anchors.append((observed["date"], observed["shares"]))
+    if anchors:
+        return max(anchors, key=lambda r: r[0])[1]
+    if events:
+        return events[0]["old_shares"]
+    first = conn.execute("SELECT shares FROM instrument_shares WHERE inscode=? ORDER BY date LIMIT 1",
+                         (str(inscode),)).fetchone()
+    return first["shares"] if first else None
+
+
+def comparable_volume(conn, symbol, row, day):
+    volume = to_float(row.get("volume"), 0)
+    inscode = row.get("inscode") or meta_get(conn, f"inscode:{symbol}")
+    shares_then = share_count_on_date(conn, inscode, to_int(row.get("date"), 0))
+    shares_now = share_count_on_date(conn, inscode, day)
+    return volume * shares_now / shares_then if shares_then and shares_now else volume
+
+
 def previous_volume_average(conn, symbol, day, sessions=20):
+    # Today and suspended/zero-volume sessions are never part of the denominator.
     rows = [r for r in get_daily_rows(conn, symbol)
             if to_int(r.get("date"), 0) < day and to_float(r.get("volume"), 0) > 0][-sessions:]
-    return (sum(to_float(r["volume"], 0) for r in rows)/len(rows), len(rows)) if rows else (None, 0)
+    return (sum(comparable_volume(conn, symbol, r, day) for r in rows)/len(rows), len(rows)) if rows else (None, 0)
 
 
 def save_client_intraday(conn, live, captured_at=None):
@@ -1170,29 +1293,38 @@ def format_market_alert(title, symbol, captured_at, sections, minutes=None):
     return "\n\n".join([header] + [s.strip() for s in sections if s and s.strip()])
 
 
-def format_trade_window_alert(conn, live, reference, captured_at, title, extra="", flow_reference=None):
+def format_trade_window_alert(conn, live, reference, captured_at, title, extra="", flow_reference=None,
+                              flow_segments=None, residual=False, duration_override=None):
     """Price window and received ClientType updates are deliberately labelled separately."""
     current = live.get("current") or {}
     reference = reference or {}
     sample = published_client_snapshot(conn, live)
     flow_reference = flow_reference if flow_reference is not None else reference
     change = client_interval(sample, flow_reference)
+    if flow_segments is not None:
+        change = sum_flow_segments(flow_segments)
+        flow_reference = flow_segments[0][0] if flow_segments else {}
     price = to_float(current.get("pDrCotVal"), 0)
     old_price = to_float(reference.get("last_price"), 0)
     yesterday = to_float(current.get("priceYesterday"), 0)
     price_at = live.get("price_received_at") or captured_at
     cur_sec, ref_sec = _hms_to_seconds(price_at), _hms_to_seconds(reference.get("captured_at"))
     minutes = (cur_sec-ref_sec)/60 if cur_sec is not None and ref_sec is not None and cur_sec >= ref_sec else None
+    if duration_override is not None:
+        minutes = duration_override
     current_display = fmt_price_pct(price, yesterday)
     display = (alert_rtl_change(fmt_price_pct(old_price, yesterday), current_display)
                if old_price > 0 and old_price != price else alert_ltr(current_display))
     sections = [f"قیمت: {display}"]
     if change and change["classified_volume"] > 0:
         total = change["classified_volume"]
+        flow_end = flow_segments[-1][1] if flow_segments else sample
         clock = alert_rtl_change(str(flow_reference["captured_at"]).split(".")[0],
-                                 str(sample["captured_at"]).split(".")[0])
+                                 str(flow_end["captured_at"]).split(".")[0])
+        note = "جمع بخش‌های گزارش‌نشده در پنجرهٔ ۵ دقیقه\n" if flow_segments and len(flow_segments) > 1 else ""
+        volume_label = "حجم گزارش‌نشده" if residual else "حجم بازه"
         sections.append(f"زمان دریافت آمار: {clock}\n"
-                        f"حجم بازه: {alert_shares(total)} ≈ {alert_money(estimate_trade_value_toman(total, price))}")
+                        + note + f"{volume_label}: {alert_shares(total)} ≈ {alert_money(estimate_trade_value_toman(total, price))}")
         real_lines = [format_estimated_side_average(side, change[f"real_{key}_volume"],
                        change[f"real_{key}_count"], price)
                       for side, key in (("خرید", "buy"), ("فروش", "sell"))
@@ -1237,11 +1369,15 @@ def format_legal_flow(buy_v, sell_v, price_rial, buy_count_delta=0, sell_count_d
 
 def format_book_alert(title, symbol, captured_at, yesterday, label="صف",
                       before=None, now=None, before_price=0, now_price=0, traded=None):
+    preopen = is_preopen(captured_at)
+    price_label = "قیمت سفارش" if preopen else "قیمت"
+    if preopen:
+        title += " — پیش‌گشایش"
     lines = []
     if before_price > 0 and now_price > 0 and before_price != now_price:
-        lines.append("قیمت: " + alert_rtl_change(fmt_price_pct(before_price, yesterday), fmt_price_pct(now_price, yesterday)))
+        lines.append(price_label + ": " + alert_rtl_change(fmt_price_pct(before_price, yesterday), fmt_price_pct(now_price, yesterday)))
     elif max(before_price, now_price) > 0:
-        lines.append("قیمت: " + alert_ltr(fmt_price_pct(now_price or before_price, yesterday)))
+        lines.append(price_label + ": " + alert_ltr(fmt_price_pct(now_price or before_price, yesterday)))
     if before is not None and now is not None:
         # Keep Persian units on both operands even if the client strips direction isolates.
         lines.append(f"حجم {label}: " + alert_rtl_change(book_shares(before), book_shares(now)))
@@ -1259,7 +1395,7 @@ def format_book_alert(title, symbol, captured_at, yesterday, label="صف",
         lines.append("ارزش: " + alert_money(estimate_trade_value_toman(now, now_price)))
     elif before is not None and before_price > 0:
         lines.append("ارزش قبلی: " + alert_money(estimate_trade_value_toman(before, before_price)))
-    if traded is not None and traded > 0:
+    if not preopen and traded is not None and traded > 0:
         lines.append(f"معامله بازه: {alert_shares(traded)}")
     return format_market_alert(title, symbol, captured_at, ["\n".join(lines)])
 
@@ -1309,7 +1445,284 @@ def alert_allowed(conn, key, cooldown_seconds=None):
 def current_has_trades(current):
     market_time = to_int(current.get("hEven") or current.get("lastHEven"), 0)
     return (to_float(current.get("qTotTran5J"), 0) > 0
-            and to_float(current.get("pDrCotVal"), 0) > 0 and market_time >= 90000)
+            and to_float(current.get("pDrCotVal"), 0) > 0 and market_time >= TRADING_START_HHMMSS)
+
+
+def is_preopen(captured_at):
+    seconds = _hms_to_seconds(captured_at)
+    return seconds is not None and 8 * 3600 + 45 * 60 <= seconds < 9 * 3600
+
+
+def real_flow_signal(change, price, threshold):
+    """Per-side money bands after the existing volume/concentration conditions.
+
+    The 150m estimated average exception is only for purchases below 200m.
+    A side with no new people still has a valid volume/value but no invented average.
+    """
+    candidates = []
+    for key, side in (("buy", "خرید"), ("sell", "فروش")):
+        volume = change[f"real_{key}_volume"]
+        count = change[f"real_{key}_count"]
+        if volume < threshold or count > CONCENTRATED_MAX_NEW_PEOPLE or price <= 0:
+            continue
+        value = estimate_trade_value_toman(volume, price)
+        if value > REAL_FLOW_HEAVY_TOMAN:
+            candidates.append((2, side, "سنگین"))
+        elif value >= REAL_FLOW_NOTICE_TOMAN:
+            candidates.append((1, side, "قابل‌توجه"))
+        elif key == "buy" and count > 0 and value / count >= SMALL_BUY_MIN_AVERAGE_TOMAN:
+            candidates.append((0, side, "با سرانه قابل‌توجه"))
+    if not candidates:
+        return None
+    rank = max(c[0] for c in candidates)
+    selected = [c for c in candidates if c[0] == rank]
+    side = " و ".join(c[1] for c in selected)
+    emoji = "🚨" if rank == 2 else "🔎"
+    if rank == 0:
+        return "🔎 خرید حقیقی با سرانه قابل‌توجه"
+    return f"{emoji} {side} {selected[0][2]} حقیقی"
+
+
+class MarketAlert(str):
+    """A normal Telegram string with durable delivery/coverage metadata."""
+    def __new__(cls, text, report):
+        value = super().__new__(cls, text)
+        value.report = report
+        value.report_id = hashlib.sha256((text + json.dumps(report, sort_keys=True,
+                                         ensure_ascii=False)).encode()).hexdigest()
+        return value
+
+
+def market_targets():
+    return list(dict.fromkeys(str(t).strip() for t in (TELEGRAM_CHANNEL_ID, TELEGRAM_CHAT_ID) if str(t or "").strip()))
+
+
+def coverage_reports(conn, symbol, day, include_pending=False):
+    targets = market_targets()
+    target = targets[0] if targets else "preview"
+    rows = []
+    tables = ("market_alert_receipts", "market_alert_outbox") if include_pending else ("market_alert_receipts",)
+    for table in tables:
+        rows.extend(conn.execute(f"""SELECT payload,created,rowid FROM {table}
+            WHERE target=? AND symbol=? AND date=?""", (target, symbol, day)).fetchall())
+    return [json.loads(row["payload"]) for row in sorted(rows, key=lambda r:(r["created"], r["rowid"]))]
+
+
+def sum_flow_segments(segments):
+    total = dict.fromkeys(list(CLIENT_FIELDS) + ["classified_volume"], 0)
+    for before, after in segments:
+        delta = client_interval(after, before)
+        if delta is None:
+            return None
+        for key in total:
+            total[key] += delta[key]
+    return total if segments else None
+
+
+def unreported_flow(conn, symbol, day, before, after, planned=(), reserve_pending=False):
+    """Subtract the union of actually delivered intervals, preserving exact counters."""
+    if client_interval(after, before) is None:
+        return []
+    floor = meta_get(conn, f"coverage_client_floor:{day}:{symbol}")
+    if floor:
+        floor = json.loads(floor)
+        if floor.get("epoch", 0) != after.get("epoch", 0):
+            return []
+        if floor["captured_at"] > before["captured_at"]:
+            before = floor
+    if client_interval(after, before) is None:
+        return []
+    remaining = [(before, after)]
+    # Pending ranges remain in the durable retry queue, rather than being enqueued
+    # a second time. They are never recorded as successfully delivered coverage.
+    reports = coverage_reports(conn, symbol, day, include_pending=reserve_pending) + list(planned)
+    for report in reports:
+        for start, end in report.get("flow", []):
+            if start.get("epoch", 0) != after.get("epoch", 0):
+                continue
+            updated = []
+            for left, right in remaining:
+                if end["captured_at"] <= left["captured_at"] or start["captured_at"] >= right["captured_at"]:
+                    updated.append((left, right))
+                    continue
+                if left["captured_at"] < start["captured_at"] and client_interval(start, left) is not None:
+                    updated.append((left, start))
+                if end["captured_at"] < right["captured_at"] and client_interval(right, end) is not None:
+                    updated.append((end, right))
+            remaining = updated
+    return [(a, b) for a, b in remaining if (client_interval(b, a) or {}).get("classified_volume", 0) > 0]
+
+
+def fresh_price_reference(conn, symbol, day, reference, current):
+    anchors = [reference]
+    floor = meta_get(conn, f"coverage_price_floor:{day}:{symbol}")
+    if floor:
+        anchors.append(json.loads(floor))
+    for report in coverage_reports(conn, symbol, day, include_pending=True):
+        if report.get("price"):
+            anchors.append(report["price"][1])
+    return max((r for r in anchors if r and r["captured_at"] <= current["captured_at"]),
+               key=lambda r: r["captured_at"])
+
+
+def client_reference_for_price(conn, symbol, day, reference, sample):
+    if not sample or not reference:
+        return None
+    row = alert_sample(conn, symbol, day, "client", lower=reference["captured_at"],
+                       upper=sample["captured_at"], oldest=True)
+    return row if client_interval(sample, row) is not None else None
+
+
+def phase_volume_allowed(conn, symbol, day, reference, sample, price):
+    client_ref = client_reference_for_price(conn, symbol, day, reference, sample)
+    change = client_interval(sample, client_ref)
+    average, _ = previous_volume_average(conn, symbol, day)
+    return bool(change and average and change["classified_volume"] >= average * PHASE_MIN_VOLUME_FRACTION
+                and estimate_trade_value_toman(change["classified_volume"], price) >= PHASE_MIN_VALUE_TOMAN)
+
+
+def compose_market_reports(conn, live, flow_candidates, price_candidates, observation, sample):
+    """One body per reported interval, with all coincident reasons in that body."""
+    symbol = live["symbol"]
+    day = to_int(live["current"].get("dEven"), 0)
+    price = observation["last_price"]
+    prepared = []
+    # The short interval is handled first. Longer windows then see only the remainder.
+    for candidate in sorted(flow_candidates, key=lambda r: r["reference"]["captured_at"], reverse=True):
+        ref = candidate["reference"]
+        segments = unreported_flow(conn, symbol, day, ref, sample, [p["report"] for p in prepared], reserve_pending=True)
+        delta = sum_flow_segments(segments)
+        kind, title = candidate["kind"], candidate["title"]
+        if delta is None:
+            # Only the exact same interval can contribute another reason to its message.
+            for old in prepared:
+                if old["reference"]["captured_at"] == ref["captured_at"] and kind != "volume":
+                    old_delta = sum_flow_segments(old["segments"])
+                    if kind == "real":
+                        title = real_flow_signal(old_delta, price, candidate["threshold"])
+                    elif kind == "legal":
+                        net = old_delta["legal_buy_volume"] - old_delta["legal_sell_volume"]
+                        title = (("🏢 خرید خالص سنگین حقوقی" if net > 0 else "🏢 فروش خالص سنگین حقوقی")
+                                 if abs(net) >= candidate["threshold"] else None)
+                    if title and title not in old["extras"] and title != old["title"]:
+                        old["extras"].append(title)
+            continue
+        if kind == "real":
+            title = real_flow_signal(delta, price, candidate["threshold"])
+            valid = title is not None
+        elif kind == "legal":
+            net = delta["legal_buy_volume"] - delta["legal_sell_volume"]
+            valid = abs(net) >= candidate["threshold"]
+            title = "🏢 خرید خالص سنگین حقوقی" if net > 0 else "🏢 فروش خالص سنگین حقوقی"
+        else:
+            valid = delta["classified_volume"] >= candidate["threshold"]
+        if not valid:
+            continue
+        residual = delta["classified_volume"] != client_interval(sample, ref)["classified_volume"]
+        reference = dict(ref)
+        reference["captured_at"] = segments[0][0]["captured_at"]
+        reference["last_price"] = segments[0][0].get("last_price", price)
+        report = dict(symbol=symbol, date=day, flow=segments)
+        if reference.get("last_price", price) != price and segments[-1][1]["captured_at"] == sample["captured_at"]:
+            report["price"] = [reference, observation]
+        prior_volume = next((r for r in prepared if r.get("kind") == "volume"), None) if kind == "volume" else None
+        if prior_volume:
+            pieces = sorted(prior_volume["segments"] + segments, key=lambda r:r[0]["captured_at"])
+            merged = []
+            for a, b in pieces:
+                if merged and merged[-1][1]["captured_at"] == a["captured_at"]:
+                    merged[-1] = (merged[-1][0], b)
+                else:
+                    merged.append((a,b))
+            prior_volume["segments"] = merged
+            prior_volume["report"]["flow"] = merged
+            prior_volume["reference"] = merged[0][0]
+            prior_volume["residual"] = True
+            if merged[0][0].get("last_price", price) != price:
+                prior_volume["report"]["price"] = [merged[0][0], observation]
+        else:
+            prepared.append(dict(title=title, reference=reference, segments=segments, residual=residual,
+                                 report=report, extras=[], kind=kind))
+
+    groups = defaultdict(list)
+    for candidate in price_candidates:
+        groups[candidate["direction"]].append(candidate)
+    for choices in groups.values():
+        selected = max(choices, key=lambda r: r["priority"])
+        ref = selected["reference"]
+        # Reuse a simultaneous flow message rather than reproducing its numbers.
+        combined = next((r for r in prepared if r["segments"] and not r.get("price_signal")
+                         and r["segments"][-1][1]["captured_at"] == sample["captured_at"]), None) if sample else None
+        if combined is None:
+            client_ref = client_reference_for_price(conn, symbol, day, ref, sample)
+            segments = unreported_flow(conn, symbol, day, client_ref, sample,
+                                       [p["report"] for p in prepared], reserve_pending=True) if client_ref else []
+            combined = dict(title=selected["title"], reference=ref, segments=segments,
+                            residual=False, report=dict(symbol=symbol, date=day, flow=segments), extras=[])
+            prepared.append(combined)
+        else:
+            combined["extras"].append(combined["title"])
+            combined["title"] = selected["title"]
+            combined["reference"] = ref
+        combined["report"]["price"] = [ref, observation]
+        combined["price_signal"] = True
+        for item in choices:
+            if item is not selected:
+                combined["extras"].append(item["title"])
+
+    messages = []
+    for item in prepared:
+        extras = list(dict.fromkeys(s.split(" ", 1)[-1] for s in item["extras"]))
+        text = format_trade_window_alert(conn, live, item["reference"], observation["captured_at"],
+                    item["title"], extra=" · ".join(extras), flow_segments=item["segments"], residual=item["residual"],
+                    duration_override=(sum(_hms_to_seconds(b["captured_at"])-_hms_to_seconds(a["captured_at"])
+                                           for a,b in item["segments"])/60
+                                       if item["segments"] and not item.get("price_signal") else None))
+        messages.append(MarketAlert(text, item["report"]))
+    return messages
+
+
+def acknowledge_market_alert(conn, message, target):
+    r = message.report
+    conn.execute("INSERT OR IGNORE INTO market_alert_receipts VALUES(?,?,?,?,?,?,?)",
+                 (target, message.report_id, r["symbol"], r["date"], str(message),
+                  json.dumps(r, ensure_ascii=False), time.time()))
+    conn.execute("DELETE FROM market_alert_outbox WHERE target=? AND report_id=?", (target, message.report_id))
+    conn.commit()
+
+
+def deliver_market_alert(conn, message):
+    if not isinstance(message, MarketAlert):
+        return telegram_broadcast_message(message)
+    sent = False
+    r = message.report
+    for target in market_targets():
+        if conn.execute("SELECT 1 FROM market_alert_receipts WHERE target=? AND report_id=?",
+                        (target, message.report_id)).fetchone():
+            continue
+        conn.execute("INSERT OR IGNORE INTO market_alert_outbox VALUES(?,?,?,?,?,?,?)",
+                     (target, message.report_id, r["symbol"], r["date"], str(message),
+                      json.dumps(r, ensure_ascii=False), time.time()))
+        conn.commit()
+        if telegram_send_message(str(message), chat_id=target):
+            acknowledge_market_alert(conn, message, target)
+            sent = True
+    return sent
+
+
+def retry_market_outbox(conn):
+    day = int(tehran_now().strftime("%Y%m%d"))
+    targets = market_targets()
+    if not targets:
+        return
+    rows = conn.execute("""SELECT * FROM market_alert_outbox WHERE date=?
+        ORDER BY (target=?) DESC,created,rowid LIMIT 20""", (day, targets[0])).fetchall()
+    for row in rows:
+        if row["target"] not in targets:
+            continue
+        if not telegram_send_message(row["text"], chat_id=row["target"]):
+            break
+        acknowledge_market_alert(conn, MarketAlert(row["text"], json.loads(row["payload"])), row["target"])
 
 
 def detect_fast_alerts(conn, live, captured_at):
@@ -1333,91 +1746,77 @@ def detect_fast_alerts(conn, live, captured_at):
     if prev and (official_delta < 0 or market_time < prev.get("market_time", 0)):
         official_delta = None
 
-    sample = accept_client_snapshot(conn, live, client_at) if current_has_trades(current) else None
-    if not current_has_trades(current):
+    # The received clock also gates trading signals, even if the API carries old counters.
+    trading_active = current_has_trades(current) and not is_preopen(price_at) and not is_preopen(client_at)
+    sample = accept_client_snapshot(conn, live, client_at) if trading_active else None
+    if not trading_active:
         live["_client_sample"] = None
         live["_client_status"] = "BEFORE_TRADE"
         live["_flow_reference"] = None
     flow_ref = live.get("_flow_reference")
     change = client_interval(sample, flow_ref)
     threshold = alert_threshold_shares(conn, symbol, date_value=date_value)
+    flow_candidates = []
+    price_candidates = []
+    observation = dict(captured_at=price_at, volume=official_volume,
+                       last_price=last_price, market_time=market_time)
+    # A first activation starts here, even when an old collector populated this DB.
+    floor_key = f"coverage_price_floor:{date_value}:{symbol}"
+    if trading_active and not meta_get(conn, floor_key):
+        meta_set(conn, floor_key, json.dumps(observation, ensure_ascii=False))
+        previous_price = None
+    client_floor_key = f"coverage_client_floor:{date_value}:{symbol}"
+    floor = json.loads(meta_get(conn, client_floor_key, "null"))
+    if sample and (not floor or floor.get("epoch", 0) != sample.get("epoch", 0)):
+        meta_set(conn, client_floor_key, json.dumps(sample, ensure_ascii=False))
+        change = None
+        flow_ref = None
     if change:
-        flow_reports = []
-        volume_title = "📊 حجم قابل‌توجه در بازهٔ کوتاه"
-        heavy_buy = (change["real_buy_volume"] >= threshold
-                     and change["real_buy_count"] <= CONCENTRATED_MAX_NEW_PEOPLE)
-        heavy_sell = (change["real_sell_volume"] >= threshold
-                      and change["real_sell_count"] <= CONCENTRATED_MAX_NEW_PEOPLE)
-        if (heavy_buy or heavy_sell) and alert_allowed(conn, f"{symbol}:realflow"):
-            flow_reports.append((flow_ref, "🚨 معاملات سنگین حقیقی"))
-        legal_net = change["legal_buy_volume"]-change["legal_sell_volume"]
+        flow_title = real_flow_signal(change, last_price, threshold)
+        if flow_title and alert_allowed(conn, f"{symbol}:realflow"):
+            flow_candidates.append(dict(reference=flow_ref, title=flow_title, kind="real", threshold=threshold))
+        legal_net = change["legal_buy_volume"] - change["legal_sell_volume"]
         legal_threshold = alert_threshold_shares(conn, symbol, LEGAL_FLOW_DAILY_VOLUME_FRACTION, date_value)
         if abs(legal_net) >= legal_threshold:
             side = "buy" if legal_net > 0 else "sell"
             if alert_allowed(conn, f"{symbol}:legalflow:{side}", LEGAL_FLOW_COOLDOWN_SECONDS):
                 title = "🏢 خرید خالص سنگین حقوقی" if legal_net > 0 else "🏢 فروش خالص سنگین حقوقی"
-                flow_reports.append((flow_ref, title))
+                flow_candidates.append(dict(reference=flow_ref, title=title, kind="legal", threshold=legal_threshold))
 
-        # No price-change or participant-count gate for the independent volume signal.
-        # The reported boundary prevents overlapping rolling windows reporting old volume.
         sample_threshold = alert_threshold_shares(conn, symbol, VOLUME_BURST_SAMPLE_FRACTION, date_value)
         window_threshold = alert_threshold_shares(conn, symbol, VOLUME_BURST_WINDOW_FRACTION, date_value)
         seconds = _hms_to_seconds(client_at)
         window_ref = alert_sample(conn, symbol, date_value, "client",
                                   lower=_seconds_to_hms(seconds-VOLUME_BURST_WINDOW_SECONDS),
                                   before=client_at, oldest=True)
-        boundary_key = f"volume_burst_boundary:{date_value}:{symbol}"
-        try:
-            boundary = json.loads(meta_get(conn, boundary_key, "null"))
-        except (ValueError, TypeError):
-            boundary = None
-        if boundary and window_ref and boundary["captured_at"] > window_ref["captured_at"]:
-            window_ref = boundary
         window_change = client_interval(sample, window_ref)
-        fresh_ref = window_ref if boundary and window_ref else flow_ref
-        if client_interval(sample, fresh_ref) is None:
-            fresh_ref = flow_ref
-        burst_ref = fresh_ref if change["classified_volume"] >= sample_threshold else None
-        if burst_ref is None and window_change and window_change["classified_volume"] >= window_threshold:
-            burst_ref = window_ref
-        pending_key = f"volume_burst_pending:{date_value}:{symbol}"
-        try:
-            pending_ref = json.loads(meta_get(conn, pending_key, "null"))
-        except (ValueError, TypeError):
-            pending_ref = None
-        if pending_ref and client_interval(sample, pending_ref) is None:
-            pending_ref = None
+        bursts = []
+        if change["classified_volume"] >= sample_threshold:
+            bursts.append((flow_ref, sample_threshold))
+        if window_change and window_change["classified_volume"] >= window_threshold:
+            bursts.append((window_ref, window_threshold))
+        pending_key = f"coverage_volume_pending:{date_value}:{symbol}"
+        pending = json.loads(meta_get(conn, pending_key, "null"))
+        if pending:
+            pending_ref = pending["reference"]
+            if window_ref and pending_ref["captured_at"] < window_ref["captured_at"]:
+                pending_ref = window_ref
+            if client_interval(sample, pending_ref) is not None:
+                bursts.append((pending_ref, pending["threshold"]))
+        if bursts and alert_allowed(conn, f"{symbol}:volume_burst", VOLUME_BURST_COOLDOWN_SECONDS):
+            for ref, minimum in bursts:
+                flow_candidates.append(dict(reference=ref, title="📊 حجم قابل‌توجه در بازهٔ کوتاه",
+                                            kind="volume", threshold=minimum))
             meta_set(conn, pending_key, "null")
-        if burst_ref:
-            if pending_ref is None or burst_ref["captured_at"] < pending_ref["captured_at"]:
-                pending_ref = burst_ref
-            meta_set(conn, pending_key, json.dumps(pending_ref, ensure_ascii=False))
-        if pending_ref and alert_allowed(conn, f"{symbol}:volume_burst", VOLUME_BURST_COOLDOWN_SECONDS):
-            flow_reports.append((pending_ref, volume_title))
-            meta_set(conn, boundary_key, json.dumps(sample, ensure_ascii=False))
-            meta_set(conn, pending_key, "null")
-
+        elif bursts:
+            ref, minimum = min(bursts, key=lambda r:r[0]["captured_at"])
+            meta_set(conn, pending_key, json.dumps(dict(reference=ref, threshold=minimum), ensure_ascii=False))
         average, _ = previous_volume_average(conn, symbol, date_value)
         if average and flow_ref["classified_volume"]/average < VOLUME_RATIO_ALERT <= sample["classified_volume"]/average:
             if alert_allowed(conn, f"{symbol}:volumeratio"):
-                flow_reports.append((flow_ref, "🔥 حجم غیرعادی"))
+                flow_candidates.append(dict(reference=flow_ref, title="🔥 حجم غیرعادی", kind="ratio", threshold=1))
 
-        # All candidates end at the same accepted snapshot. Compare the nested
-        # windows by traded shares and report the shortest when they mostly coincide.
-        groups = []
-        for ref, title in sorted(flow_reports, key=lambda report: report[0]["captured_at"], reverse=True):
-            volume = sample["classified_volume"] - ref["classified_volume"]
-            if groups and groups[-1][1] > 0 and 10 * groups[-1][1] >= 9 * volume:
-                groups[-1][2].append(title)
-            else:
-                groups.append((ref, volume, [title]))
-        for ref, _, titles in groups:
-            title = volume_title if volume_title in titles else titles[0]
-            other_signals = [signal.split(" ", 1)[1] for signal in titles if signal != title]
-            extra = " · ".join(other_signals)
-            alerts.append(format_trade_window_alert(conn, live, ref, client_at, title, extra=extra))
-
-    price_valid = current_has_trades(current) and price_yesterday > 0
+    price_valid = trading_active and price_yesterday > 0
     if previous_price and (price_at <= previous_price["captured_at"]
                            or official_volume < previous_price["volume"]
                            or market_time < previous_price["market_time"]):
@@ -1441,55 +1840,50 @@ def detect_fast_alerts(conn, live, captured_at):
                                              symbol, price_at, ["\n".join(lines)]))
         meta_set(conn, opening_key, "1")
     elif price_valid and previous_price:
-        previous_last = previous_price["last_price"]
+        fresh_ref = fresh_price_reference(conn, symbol, date_value, previous_price, observation)
+        previous_last = fresh_ref["last_price"]
         last_pct = pct_change(last_price, price_yesterday)
         previous_pct = pct_change(previous_last, price_yesterday)
         move = pct_change(last_price, previous_last)
-        # A price-only signal may precede the classified feed; omit unavailable flows.
         volume_ok = change is None or change["classified_volume"] == 0 or change["classified_volume"] >= max(50_000, threshold*.35)
         if abs(move) >= SUDDEN_PRICE_PCT_30S and volume_ok:
             up = move > 0
             key = "priceup" if up else "pricedown"
             if alert_allowed(conn, f"{symbol}:{key}"):
-                title = "🚀 جهش رو به بالا" if up else "🔻 ریزش ناگهانی"
-                alerts.append(format_trade_window_alert(conn, live, previous_price, price_at, title,
-                                                        flow_reference=flow_ref or {}))
+                price_candidates.append(dict(title="🚀 جهش رو به بالا" if up else "🔻 ریزش ناگهانی",
+                                             reference=fresh_ref, direction=up, priority=2))
         price_ref = momentum_reference_snapshot(conn, symbol, date_value, price_at, kind="price")
         if price_ref:
-            client_ref = momentum_reference_snapshot(conn, symbol, date_value, client_at)
+            price_ref = fresh_price_reference(conn, symbol, date_value, price_ref, observation)
+            client_ref = client_reference_for_price(conn, symbol, date_value, price_ref, sample)
             momentum_change = client_interval(sample, client_ref)
             volume = momentum_change["classified_volume"] if momentum_change else None
             movement = pct_change(last_price, price_ref["last_price"])
             ref_pct = pct_change(price_ref["last_price"], price_yesterday)
             momentum_threshold = alert_threshold_shares(conn, symbol, MOMENTUM_DAILY_VOLUME_FRACTION, date_value)
-            # No invented volume while classification is unavailable.
             volume_ok = volume is None or volume == 0 or volume >= momentum_threshold
             if abs(movement) >= MOMENTUM_PRICE_PCT and volume_ok:
                 up = movement > 0
                 key = "momentumup" if up else "momentumdown"
                 if alert_allowed(conn, f"{symbol}:{key}", MOMENTUM_ALERT_COOLDOWN_SECONDS):
-                    if up:
-                        title = "🟢 تقویت مثبت / خرید رو به بالا" if ref_pct > 0 and last_pct > 0 else "📈 خرید رو به بالا / مومنتوم مثبت"
-                    else:
-                        title = "📉 فروش رو به پایین / مومنتوم منفی"
-                    alerts.append(format_trade_window_alert(conn, live, price_ref, price_at, title,
-                                                            flow_reference=client_ref or {}))
+                    title = ("🟢 تقویت مثبت / خرید رو به بالا" if ref_pct > 0 and last_pct > 0
+                             else "📈 خرید رو به بالا / مومنتوم مثبت") if up else "📉 فروش رو به پایین / مومنتوم منفی"
+                    price_candidates.append(dict(title=title, reference=price_ref, direction=up, priority=1))
             strengthen_threshold = alert_threshold_shares(conn, symbol, POSITIVE_STRENGTHEN_VOLUME_FRACTION, date_value)
             if (ref_pct > 0 and last_pct > 0 and last_pct-ref_pct >= POSITIVE_STRENGTHEN_PCT
                     and movement < MOMENTUM_PRICE_PCT
                     and (volume is None or volume == 0 or volume >= strengthen_threshold)
                     and alert_allowed(conn, f"{symbol}:positive_strengthen", POSITIVE_STRENGTHEN_COOLDOWN_SECONDS)):
-                alerts.append(format_trade_window_alert(conn, live, price_ref, price_at, "🟢 تقویت مثبت",
-                                                        flow_reference=client_ref or {}))
-        if previous_pct <= 0 < last_pct and last_pct-previous_pct >= .40:
-            if alert_allowed(conn, f"{symbol}:turnedgreen"):
-                alerts.append(format_trade_window_alert(conn, live, previous_price, price_at, "🟢 تغییر فاز به مثبت",
-                                                        flow_reference=flow_ref or {}))
-        elif previous_pct >= 0 > last_pct and previous_pct-last_pct >= .40:
-            if alert_allowed(conn, f"{symbol}:turnedred"):
-                alerts.append(format_trade_window_alert(conn, live, previous_price, price_at, "🔴 تغییر فاز به منفی",
-                                                        flow_reference=flow_ref or {}))
+                price_candidates.append(dict(title="🟢 تقویت مثبت", reference=price_ref, direction=True, priority=1))
+        if phase_volume_allowed(conn, symbol, date_value, fresh_ref, sample, last_price):
+            if previous_pct <= 0 < last_pct and last_pct-previous_pct >= .40:
+                if alert_allowed(conn, f"{symbol}:turnedgreen"):
+                    price_candidates.append(dict(title="🟢 تغییر فاز به مثبت", reference=fresh_ref, direction=True, priority=3))
+            elif previous_pct >= 0 > last_pct and previous_pct-last_pct >= .40:
+                if alert_allowed(conn, f"{symbol}:turnedred"):
+                    price_candidates.append(dict(title="🔴 تغییر فاز به منفی", reference=fresh_ref, direction=False, priority=3))
 
+    alerts.extend(compose_market_reports(conn, live, flow_candidates, price_candidates, observation, sample))
     observation = dict(captured_at=price_at, volume=official_volume,
                        last_price=last_price, market_time=market_time)
     if price_valid:
@@ -1565,6 +1959,40 @@ def detect_fast_alerts(conn, live, captured_at):
                             before=ref_depth, now=cur_depth,
                             before_price=ref_q_price, now_price=cur_q_price
                         ))
+
+        # Significant SELL additions outside queue states. A newly visible deeper
+        # price is not evidence of a new order; it may have been outside the old depth.
+        if prev_state == cur_state == "normal":
+            old_sells = {to_float(r.get("sell_price"), 0): to_float(r.get("sell_volume"), 0)
+                         for r in prev_book_for_state if to_float(r.get("sell_price"), 0) > 0}
+            worst_visible = max(old_sells, default=0)
+            additions = []
+            order_threshold = alert_threshold_shares(conn, symbol, ORDER_ALERT_DAILY_VOLUME_FRACTION, date_value)
+            for row in cur_book_for_state:
+                price = to_float(row.get("pMeOf"), 0)
+                volume = to_float(row.get("qTitMeOf"), 0)
+                if price <= 0 or price > worst_visible:
+                    continue
+                before = old_sells.get(price, 0)
+                if volume - before >= order_threshold:
+                    additions.append((price, before, volume))
+            if additions and alert_allowed(conn, f"{symbol}:sellincrease"):
+                if len(additions) == 1:
+                    price, before, volume = additions[0]
+                    alerts.append(format_book_alert(
+                        "🔴 افزایش قابل‌توجه سفارش فروش", symbol, book_at, price_yesterday,
+                        label="سفارش", before=before, now=volume, before_price=price, now_price=price))
+                else:
+                    preopen = is_preopen(book_at)
+                    title = "🔴 افزایش قابل‌توجه سفارش فروش" + (" — پیش‌گشایش" if preopen else "")
+                    sections = []
+                    for price, before, volume in sorted(additions):
+                        label = "قیمت سفارش" if preopen else "قیمت"
+                        sections.append(label + ": " + alert_ltr(fmt_price_pct(price, price_yesterday))
+                                        + "\nحجم سفارش: " + alert_rtl_change(book_shares(before), book_shares(volume))
+                                        + "\nافزایش: " + alert_shares(volume-before) + " ≈ "
+                                        + alert_money(estimate_trade_value_toman(volume-before, price)))
+                    alerts.append(format_market_alert(title, symbol, book_at, sections))
 
     # Order deletion / movement: compare same-price visible levels with previous 30s book.
     prev_book = previous_book_snapshot(conn, symbol, date_value, book_at)
@@ -2476,6 +2904,8 @@ def collect_live_symbol(conn, symbol):
     current = unwrap_dict(p, ("closingPriceInfo",))
     price_received_at = received_clock()
 
+    refresh_share_context(conn, symbol, inscode, current)
+
     market_date = to_int(
         current.get("dEven"),
         to_int(datetime.now().strftime("%Y%m%d"), 0)
@@ -2941,18 +3371,8 @@ def make_summary(conn, live):
         if to_int(r.get("date"), 0) < market_date
     ]
 
-    prev20 = previous_rows[-20:]
-    prev60 = previous_rows[-60:]
-
-    avgvol20_prev = (
-        sum(to_float(r.get("volume"), 0) for r in prev20) / len(prev20)
-        if prev20 else None
-    )
-
-    avgvol60_prev = (
-        sum(to_float(r.get("volume"), 0) for r in prev60) / len(prev60)
-        if prev60 else None
-    )
+    avgvol20_prev, avgvol20_sessions = previous_volume_average(conn, symbol, market_date, 20)
+    avgvol60_prev, avgvol60_sessions = previous_volume_average(conn, symbol, market_date, 60)
 
     tech = enriched[-1] if enriched else {}
 
@@ -3050,6 +3470,11 @@ def make_summary(conn, live):
 
         "AvgVol20_Previous": avgvol20_prev,
         "AvgVol60_Previous": avgvol60_prev,
+        "AvgVol20_Sessions": avgvol20_sessions,
+        "AvgVol60_Sessions": avgvol60_sessions,
+        "VolumeAverageBasis": ("SHARE_COUNT_COMPARABLE" if share_count_on_date(conn, live["inscode"], market_date)
+                               else "RAW_NO_SHARE_CONTEXT"),
+        "SharesOutstanding": share_count_on_date(conn, live["inscode"], market_date),
         "VolumeRatio20_Live": safe_div(live_volume, avgvol20_prev),
         "VolumeRatio60_Live": safe_div(live_volume, avgvol60_prev),
 
@@ -3357,7 +3782,7 @@ def telegram_send_message(text, chat_id=None):
             timeout=30,
         )
         r.raise_for_status()
-        return True
+        return r.json().get("ok") is True
     except Exception as e:
         print(f"Telegram message failed for {target}:", e)
         return False
@@ -3677,7 +4102,7 @@ def eod_headline(conn, symbol, day, summary, rows, book, bp):
     return "مرور معاملات روز", details
 
 
-def build_channel_eod_text(conn, live_data, report_complete=True):
+def build_channel_eod_messages(conn, live_data, report_complete=True):
     """Factual Persian close commentary from collected prices, flows, BP and book.
 
     This intentionally does not send a workbook or reproduce the operational
@@ -3769,8 +4194,20 @@ def build_channel_eod_text(conn, live_data, report_complete=True):
         except Exception as exc:
             print(f"EOD commentary unavailable for {symbol_tag(symbol)}: {exc}")
             sections.append(f"▪️ {symbol_tag(symbol)}: داده کافی برای جمع‌بندی موجود نیست.")
-    sections.append("قیمت‌ها به ریال‌اند و ارزش‌ها با قیمت آخر برآورد شده‌اند.")
-    return "\n\n".join(sections)
+    # One complete, independently forwardable message per symbol, in SYMBOLS order.
+    messages = [sections[0]]
+    date_line = "📅 " + alert_ltr(now.strftime("%Y/%m/%d"))
+    for section in sections[1:]:
+        first, sep, rest = section.partition("\n")
+        message = first + "\n" + date_line + ("\n" + rest if sep else "")
+        message += "\n\nقیمت‌ها ریال؛ ارزش‌ها برآورد با قیمت آخر.\n📡 نبض تابلو | هشدار بورس"
+        messages.append(message)
+    return messages
+
+
+def build_channel_eod_text(conn, live_data, report_complete=True):
+    """Compatibility for local/private previews; channel delivery uses individual messages."""
+    return "\n\n".join(build_channel_eod_messages(conn, live_data, report_complete))
 
 
 def deliver_end_of_day_reports(conn, live_data, report_path=None, report_complete=True):
@@ -3795,8 +4232,9 @@ def deliver_end_of_day_reports(conn, live_data, report_path=None, report_complet
 
     if channel_id:
         try:
-            text = build_channel_eod_text(conn, live_data, report_complete=report_complete)
-            outcomes = [telegram_send_message(part, chat_id=channel_id) for part in split_telegram_text(text)]
+            messages = build_channel_eod_messages(conn, live_data, report_complete=report_complete)
+            outcomes = [telegram_send_message(part, chat_id=channel_id)
+                        for message in messages for part in split_telegram_text(message)]
             result["channel_analysis"] = bool(outcomes) and all(outcomes)
         except Exception as exc:
             print("Channel end-of-day analysis failed:", exc)
@@ -3818,6 +4256,8 @@ def collect_fast_symbol(conn, symbol):
     )
     current = unwrap_dict(p, ("closingPriceInfo",))
     price_received_at = received_clock()
+
+    refresh_share_context(conn, symbol, inscode, current)
 
     market_date = to_int(
         current.get("dEven"),
@@ -3880,6 +4320,7 @@ def run_fast_snapshot(conn):
     API_STATUS = []
     started = time.time()
     live_data = []
+    retry_market_outbox(conn)
 
     for symbol in SYMBOLS:
         try:
@@ -3889,7 +4330,7 @@ def run_fast_snapshot(conn):
 
             # Compare against the previous 30-second snapshot before persisting the current one.
             for alert_text in detect_fast_alerts(conn, live, captured_at):
-                telegram_broadcast_message(alert_text)
+                deliver_market_alert(conn, alert_text)
 
             save_client_intraday(conn, live, captured_at=captured_at)
             save_best_limits_intraday(conn, live)
@@ -4012,7 +4453,7 @@ def heavy_worker(stop_event, report_state, report_lock):
 
 def collector_main():
     print("=" * 58)
-    print("TSETMC AUTOMATIC COLLECTOR — FAST 30s / HEAVY 5m")
+    print(f"TSETMC AUTOMATIC COLLECTOR {COLLECTOR_VERSION} — FAST 30s / HEAVY 5m")
     print("=" * 58)
     print("Local DB:", DB_PATH)
     print("Iran proxies configured:", len(TSETMC_PROXIES))
