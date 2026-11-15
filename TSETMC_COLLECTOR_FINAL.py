@@ -73,6 +73,11 @@ Revision 2026-11-14.1:
 Revision 2026-11-14.2:
   - Add Khzamia (Zamyad ordinary share) as the ninth tracked symbol to
     Fast, Heavy, order-book alerts and per-symbol close summaries.
+
+Revision 2026-11-15.1-history-backfill:
+  - Auto-download official raw daily histories for newly added or partially seeded symbols
+    when the existing DB already contains other symbols. Preserve all prior data.
+  - Explicitly report per-symbol historical coverage and failed fetches.
 """
 
 import csv
@@ -106,7 +111,7 @@ COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
 EXPORT_HISTORY_SHEETS = os.getenv("TSETMC_EXPORT_HISTORY", "0") == "1"
-COLLECTOR_VERSION = "2026-11-14.2"
+COLLECTOR_VERSION = "2026-11-15.1-history-backfill"
 PHASE_MIN_VOLUME_FRACTION = 0.01
 PHASE_MIN_VALUE_TOMAN = 50_000_000
 
@@ -2392,23 +2397,102 @@ def bootstrap_history_from_api(conn):
     meta_set(conn, "bootstrap_time", datetime.now().isoformat(timespec="seconds"))
 
 
+def backfill_missing_symbol_histories(conn, required_sessions=200):
+    """Fill missing symbols in an *existing* DB without deleting older history.
+
+    Earlier bootstraps only checked whether the daily table was nonempty.
+    Adding a new tracked symbol later therefore left its rolling 20/60-day
+    reference volumes (and technical indicators) uninitialized. This task
+    fetches historical daily rows ONLY for symbols below the target count.
+
+    The TSETMC raw daily closing-price endpoint is used deliberately: it
+    carries historical official volumes needed by alert thresholds. Adjusted
+    chart prices are NOT a replacement for raw daily volume history.
+    """
+    today = int(tehran_now().strftime("%Y%m%d"))
+    for symbol in SYMBOLS:
+        stat = conn.execute(
+            "SELECT COUNT(*) AS n, MAX(date) AS newest FROM daily "
+            "WHERE symbol=? AND volume>0 AND pclosing>0 AND date<?",
+            (symbol, today),
+        ).fetchone()
+        before = int(stat["n"] or 0)
+        if before >= required_sessions:
+            continue
+
+        print(f"  HISTORY BACKFILL needed: {symbol} ({before} existing trading days)")
+        try:
+            inscode = meta_get(conn, f"inscode:{symbol}") or find_symbol_online(symbol)
+            if not str(inscode).isdigit():
+                raise RuntimeError("Invalid insCode")
+            meta_set(conn, f"inscode:{symbol}", inscode)
+
+            payload = api_get(
+                f"ClosingPrice/GetClosingPriceDailyList/{inscode}/0",
+                symbol, "MISSING_SYMBOL_History", allow_fail=False,
+            )
+            # Do not accept an arbitrary list from an unrelated JSON property.
+            rows = payload if isinstance(payload, list) else (
+                payload.get("closingPriceDaily") if isinstance(payload, dict) else None
+            )
+            if not isinstance(rows, list) or not rows:
+                raise RuntimeError("No official historical daily records returned")
+
+            accepted = 0
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                d = to_int(r.get("dEven"), 0)
+                if not (20000101 <= d < today):
+                    continue  # Never finalize an in-progress trading day.
+                if to_float(r.get("pClosing"), 0) <= 0 or to_float(r.get("qTotTran5J"), 0) <= 0:
+                    continue
+                upsert_daily(conn, symbol, inscode, r, finalized=True)
+                accepted += 1
+            if accepted == 0:
+                raise RuntimeError("Official history has no valid traded sessions")
+
+            result = conn.execute(
+                "SELECT COUNT(*) AS n, MAX(date) AS newest FROM daily "
+                "WHERE symbol=? AND volume>0 AND pclosing>0 AND date<?",
+                (symbol, today),
+            ).fetchone()
+            count = int(result["n"] or 0)
+            # A short-history IPO can legitimately have fewer than 200 sessions;
+            # report observed coverage rather than making up missing dates.
+            level = "READY" if count >= 20 else "INSUFFICIENT(<20)"
+            print(f"  HISTORY {level}: {symbol}: {before} -> {count} trading days; "
+                  f"latest={result['newest']}; accepted={accepted}")
+            if count < 20:
+                API_STATUS.append({
+                    "Symbol": symbol, "Endpoint": "HISTORY_COVERAGE",
+                    "Status": "INCOMPLETE", "HTTP": "", "Attempts": "",
+                    "Seconds": "", "Error": f"Only {count} valid sessions (<20)",
+                })
+        except Exception as exc:
+            # Preserve the seven working symbols if the new symbol or endpoint fails.
+            print(f"  HISTORY BACKFILL FAILED for {symbol}: {exc}")
+            API_STATUS.append({
+                "Symbol": symbol, "Endpoint": "HISTORY_BACKFILL",
+                "Status": "FAILED", "HTTP": "", "Attempts": "",
+                "Seconds": "", "Error": str(exc),
+            })
+
+
 def ensure_bootstrap(conn):
-    if daily_count(conn) > 0:
-        return
+    if daily_count(conn) == 0:
+        baseline = locate_baseline_file()
+        if baseline:
+            import_v4_history(conn, baseline)
+        elif ALLOW_ONE_TIME_API_BOOTSTRAP:
+            bootstrap_history_from_api(conn)
+        else:
+            raise RuntimeError(
+                "No local history DB and no V4 baseline workbook found."
+            )
 
-    baseline = locate_baseline_file()
-
-    if baseline:
-        import_v4_history(conn, baseline)
-        return
-
-    if ALLOW_ONE_TIME_API_BOOTSTRAP:
-        bootstrap_history_from_api(conn)
-        return
-
-    raise RuntimeError(
-        "No local history DB and no V4 baseline workbook found."
-    )
+    # A nonempty DB may still be missing recently added symbols.
+    backfill_missing_symbol_histories(conn)
 
 
 # ============================================================
