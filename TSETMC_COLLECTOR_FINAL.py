@@ -78,6 +78,16 @@ Revision 2026-11-15.1-history-backfill:
   - Auto-download official raw daily histories for newly added or partially seeded symbols
     when the existing DB already contains other symbols. Preserve all prior data.
   - Explicitly report per-symbol historical coverage and failed fetches.
+
+Revision 2026-11-15.2-alert-validation:
+  - Visible order-book price absence is unknown unless it remains inside the
+    displayed depth. Confirm large disappearances in a second fast observation.
+  - Apply a minimum 500K shares and 5% relative drop plus historical threshold,
+    and require aligned official volume to avoid interpreting trades as removal.
+  - Use neutral order-reduction wording (never assert proven cancellation).
+  - Reject low-value volume-only alerts unless a complete previous 20-session
+    baseline and at least 1% of current daily volume support them; recheck after
+    subtracting already-reported client-flow intervals.
 """
 
 import csv
@@ -111,7 +121,7 @@ COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
 EXPORT_HISTORY_SHEETS = os.getenv("TSETMC_EXPORT_HISTORY", "0") == "1"
-COLLECTOR_VERSION = "2026-11-15.1-history-backfill"
+COLLECTOR_VERSION = "2026-11-15.2-alert-validation"
 PHASE_MIN_VOLUME_FRACTION = 0.01
 PHASE_MIN_VALUE_TOMAN = 50_000_000
 
@@ -157,6 +167,16 @@ VOLUME_BURST_SAMPLE_FRACTION = max(0.001, float(os.getenv("VOLUME_BURST_SAMPLE_F
 VOLUME_BURST_WINDOW_FRACTION = max(0.001, float(os.getenv("VOLUME_BURST_WINDOW_FRACTION", "0.20")))
 VOLUME_BURST_WINDOW_SECONDS = 300
 VOLUME_BURST_COOLDOWN_SECONDS = max(30, int(os.getenv("VOLUME_BURST_COOLDOWN_SECONDS", "60")))
+# A volume-only headline must be meaningful relative to the session and a complete
+# previous 20-session baseline. Non-volume alerts keep their own thresholds.
+VOLUME_BURST_MIN_DAY_FRACTION = max(0.001, float(os.getenv("VOLUME_BURST_MIN_DAY_FRACTION", "0.01")))
+VOLUME_BURST_MIN_AVG20_FRACTION = max(0.001, float(os.getenv("VOLUME_BURST_MIN_AVG20_FRACTION", "0.01")))
+# A missing order-book level is not an observed zero. Guard even observable drops
+# against tiny relative/absolute moves and verify disappearing levels twice.
+ORDER_REDUCTION_MIN_SHARES = max(1, int(os.getenv("ORDER_REDUCTION_MIN_SHARES", "500000")))
+ORDER_REDUCTION_MIN_PCT = max(1.0, float(os.getenv("ORDER_REDUCTION_MIN_PCT", "5.0")))
+ORDER_REDUCTION_MAX_BOOK_GAP_SEC = max(15, int(os.getenv("ORDER_REDUCTION_MAX_BOOK_GAP_SEC", "120")))
+ORDER_REDUCTION_CONFIRM_MAX_SEC = max(30, int(os.getenv("ORDER_REDUCTION_CONFIRM_MAX_SEC", "180")))
 
 CLIENT_FIELDS = {
     "real_buy_volume": ("buy_I_Volume",),
@@ -1580,6 +1600,18 @@ def alert_threshold_shares(conn, symbol, fraction=None, date_value=None):
     return max(float(ALERT_MIN_SHARES), (average or 0)*fraction)
 
 
+def material_volume_burst(conn, symbol, day, volume, daily_volume):
+    """Validate the volume-only headline; no short/missing history fallback."""
+    avg, sessions = previous_volume_average(conn, symbol, day, sessions=20)
+    if sessions < 20 or not avg or avg <= 0 or daily_volume <= 0:
+        return False
+    if not math.isfinite(volume) or volume <= 0:
+        return False
+    return volume >= max(float(ALERT_MIN_SHARES),
+                         daily_volume * VOLUME_BURST_MIN_DAY_FRACTION,
+                         avg * VOLUME_BURST_MIN_AVG20_FRACTION)
+
+
 def alert_allowed(conn, key, cooldown_seconds=None):
     now = time.time()
     cooldown = ALERT_COOLDOWN_SECONDS if cooldown_seconds is None else max(1, int(cooldown_seconds))
@@ -1764,6 +1796,9 @@ def compose_market_reports(conn, live, flow_candidates, price_candidates, observ
             title = "🏢 خرید خالص سنگین حقوقی" if net > 0 else "🏢 فروش خالص سنگین حقوقی"
         else:
             valid = delta["classified_volume"] >= candidate["threshold"]
+            if kind == "volume":
+                valid = valid and material_volume_burst(conn, symbol, day,
+                               delta["classified_volume"], observation["volume"])
         if not valid:
             continue
         residual = delta["classified_volume"] != client_interval(sample, ref)["classified_volume"]
@@ -1873,6 +1908,117 @@ def retry_market_outbox(conn):
         acknowledge_market_alert(conn, MarketAlert(row["text"], json.loads(row["payload"])), row["target"])
 
 
+def _visible_order_volume(book, side, price):
+    """Return volume or None if the old price is outside visible book depth.
+
+    Absence is only consistent with zero *within* the currently displayed price
+    range; a level falling out of TSETMC's limited depth is never a deletion.
+    """
+    price_key, volume_key = (("pMeDem", "qTitMeDem") if side == "buy"
+                             else ("pMeOf", "qTitMeOf"))
+    fallback_price, fallback_volume = (("buy_price", "buy_volume") if side == "buy"
+                                       else ("sell_price", "sell_volume"))
+    levels = {}
+    for row in book or []:
+        if not isinstance(row, dict):
+            continue
+        p = to_float(row.get(price_key, row.get(fallback_price)), 0)
+        v = to_float(row.get(volume_key, row.get(fallback_volume)), float("nan"))
+        if p > 0 and math.isfinite(v) and v >= 0:
+            levels[p] = levels.get(p, 0) + v
+    if price in levels:
+        return levels[price], True
+    if len(levels) < 2:
+        return None, False
+    displayed_prices = list(levels)
+    # At an old bid price higher than the lowest current visible bid, a live
+    # order would have to appear in depth. The sell side is symmetric.
+    inside = ((price > min(displayed_prices)) if side == "buy"
+              else (price < max(displayed_prices)))
+    return (0.0, False) if inside else (None, False)
+
+
+def inspect_order_reductions(conn, symbol, day, book_at, prior_book, current_book,
+                             last_book_at, queue_shrink_reported=(), min_shares=0):
+    """Only confirmed, sizable *visible* depth decreases; never assert cancellation.
+
+    A visible same-price reduction is compared immediately. An absent level
+    must remain absent in two consecutive *valid* snapshots. Any stale/unknown
+    snapshot is ignored. Pending confirmation is persisted in collector metadata
+    so the next Fast iteration can complete the check.
+    """
+    t_now, t_prev = _hms_to_seconds(book_at), _hms_to_seconds(last_book_at)
+    if (t_now is None or t_prev is None or t_now <= t_prev
+            or t_now-t_prev > ORDER_REDUCTION_MAX_BOOK_GAP_SEC
+            or not prior_book or not current_book):
+        return []
+    minimum = max(ORDER_REDUCTION_MIN_SHARES, min_shares)
+    results = []
+    for side, persian in (("buy", "خرید"), ("sell", "فروش")):
+        store_key = f"order_reduction_pending:{day}:{symbol}:{side}"
+        try:
+            pending = json.loads(meta_get(conn, store_key, "{}") or "{}")
+            if not isinstance(pending, dict):
+                pending = {}
+        except (TypeError, ValueError):
+            pending = {}
+        new_pending = {}
+        old_levels = {}
+        for row in prior_book:
+            p = to_float(row.get("buy_price" if side == "buy" else "sell_price"), 0)
+            v = to_float(row.get("buy_volume" if side == "buy" else "sell_volume"), 0)
+            if p > 0 and v > 0:
+                old_levels[p] = old_levels.get(p, 0) + v
+
+        # Confirm an already noted disappearance without needing its price in
+        # the immediately previous (already-missing) book.
+        candidates = {str(int(p)): dict(price=p, volume=v, time=last_book_at)
+                      for p,v in old_levels.items()}
+        for k, saved in pending.items():
+            if not isinstance(saved, dict):
+                continue
+            if (t_now - (_hms_to_seconds(saved.get("first_missing_at")) or -1)
+                    > ORDER_REDUCTION_CONFIRM_MAX_SEC):
+                continue
+            if k not in candidates or saved.get("first_missing_at"):
+                candidates[k] = saved
+        for k, item in candidates.items():
+            original = to_float(item.get("volume"), 0)
+            old_time = item.get("time", last_book_at)
+            start_sec = _hms_to_seconds(old_time)
+            if (original < minimum or start_sec is None or t_now-start_sec <= 0
+                    or t_now-start_sec > ORDER_REDUCTION_CONFIRM_MAX_SEC):
+                continue
+            p = to_float(item.get("price"), 0)
+            current, exact = _visible_order_volume(current_book, side, p)
+            if current is None:  # outside visible depth, never a fake zero
+                continue
+            drop = original-current
+            if drop < minimum or drop < ORDER_REDUCTION_MIN_PCT*original/100:
+                continue
+            if side in queue_shrink_reported:
+                continue
+            traded = official_volume_between_books(conn, symbol, day, old_time, book_at)
+            if traded is None or traded < 0 or traded >= drop * 0.5:
+                # We cannot distinguish trades from orders without aligned data.
+                continue
+            if exact:
+                results.append(dict(side=side, label=persian, price=p,
+                                    before=original, now=current, traded=traded,
+                                    disappeared=False))
+            else:
+                first_missing = item.get("first_missing_at")
+                if first_missing and first_missing != book_at:
+                    results.append(dict(side=side, label=persian, price=p,
+                                        before=original, now=None, traded=traded,
+                                        disappeared=True))
+                else:
+                    new_pending[k] = dict(price=p, volume=original,
+                                          time=old_time, first_missing_at=book_at)
+        meta_set(conn, store_key, json.dumps(new_pending, ensure_ascii=False))
+    return results
+
+
 def detect_fast_alerts(conn, live, captured_at):
     """Independent price, classified-flow and book signals with separate Fast baselines."""
     alerts = []
@@ -1951,6 +2097,14 @@ def detect_fast_alerts(conn, live, captured_at):
                 pending_ref = window_ref
             if client_interval(sample, pending_ref) is not None:
                 bursts.append((pending_ref, pending["threshold"]))
+        # Suppress a tiny 3-5 minute interval even when an inherited low
+        # absolute threshold or a pending aggregation would otherwise trigger.
+        bursts = [(ref, minimum) for ref, minimum in bursts
+                  if (client_interval(sample, ref) is not None
+                      and client_interval(sample, ref)["classified_volume"] >= minimum
+                      and material_volume_burst(conn, symbol, date_value,
+                                                client_interval(sample, ref)["classified_volume"],
+                                                official_volume))]
         if bursts and alert_allowed(conn, f"{symbol}:volume_burst", VOLUME_BURST_COOLDOWN_SECONDS):
             for ref, minimum in bursts:
                 flow_candidates.append(dict(reference=ref, title="📊 حجم قابل‌توجه در بازهٔ کوتاه",
@@ -1959,6 +2113,13 @@ def detect_fast_alerts(conn, live, captured_at):
         elif bursts:
             ref, minimum = min(bursts, key=lambda r:r[0]["captured_at"])
             meta_set(conn, pending_key, json.dumps(dict(reference=ref, threshold=minimum), ensure_ascii=False))
+        elif pending:
+            # Keep a valid pending anchor only while the data is fresh; an
+            # incomplete history must not emit low-volume backlog later.
+            if not material_volume_burst(conn, symbol, date_value,
+                                         (client_interval(sample, pending["reference"]) or {}).get("classified_volume", 0),
+                                         official_volume):
+                meta_set(conn, pending_key, "null")
         average, _ = previous_volume_average(conn, symbol, date_value)
         if average and flow_ref["classified_volume"]/average < VOLUME_RATIO_ALERT <= sample["classified_volume"]/average:
             if alert_allowed(conn, f"{symbol}:volumeratio"):
@@ -2148,46 +2309,35 @@ def detect_fast_alerts(conn, live, captured_at):
                                         + alert_money(estimate_trade_value_toman(volume-before, price)))
                     alerts.append(format_market_alert(title, symbol, book_at, sections))
 
-    # Order deletion / movement: compare same-price visible levels with previous 30s book.
+    # Order reductions: never equate an absent price with a deleted order.
+    # Use a fresh, aligned official volume comparison and two observations of
+    # disappearing price levels. Significant exact-price reductions remain visible.
     prev_book = previous_book_snapshot(conn, symbol, date_value, book_at)
     cur_book = live.get("best") or []
-    if prev_book and cur_book and official_delta is not None:
-        cur_by_buy = {to_float(r.get("pMeDem"), 0): r for r in cur_book if isinstance(r, dict) and to_float(r.get("pMeDem"), 0) > 0}
-        cur_by_sell = {to_float(r.get("pMeOf"), 0): r for r in cur_book if isinstance(r, dict) and to_float(r.get("pMeOf"), 0) > 0}
-
-        day_volume = to_float(current.get("qTotTran5J"), 0)
-        prev_day_volume = to_float(prev.get("volume"), 0) if prev else 0
-        traded_delta = official_delta
-        oth = alert_threshold_shares(conn, symbol, ORDER_ALERT_DAILY_VOLUME_FRACTION)
-
-        for old in prev_book:
-            bp = to_float(old.get("buy_price"), 0)
-            bv = to_float(old.get("buy_volume"), 0)
-            if bp > 0 and bv >= oth:
-                newv = to_float((cur_by_buy.get(bp) or {}).get("qTitMeDem"), 0)
-                drop = bv - newv
-                if ("buy" not in queue_shrink_reported and drop >= oth
-                        and traded_delta < drop * 0.5
-                        and alert_allowed(conn, f"{symbol}:buycancel:{int(bp)}")):
-                    alerts.append(format_book_alert(
-                        "⚠️ حذف/جابجایی مشکوک سفارش خرید", symbol, book_at, price_yesterday,
-                        label="سفارش", before=bv, now=newv,
-                        before_price=bp, now_price=bp, traded=traded_delta
-                    ))
-
-            sp = to_float(old.get("sell_price"), 0)
-            sv = to_float(old.get("sell_volume"), 0)
-            if sp > 0 and sv >= oth:
-                newv = to_float((cur_by_sell.get(sp) or {}).get("qTitMeOf"), 0)
-                drop = sv - newv
-                if ("sell" not in queue_shrink_reported and drop >= oth
-                        and traded_delta < drop * 0.5
-                        and alert_allowed(conn, f"{symbol}:sellcancel:{int(sp)}")):
-                    alerts.append(format_book_alert(
-                        "⚠️ حذف/جابجایی مشکوک سفارش فروش", symbol, book_at, price_yesterday,
-                        label="سفارش", before=sv, now=newv,
-                        before_price=sp, now_price=sp, traded=traded_delta
-                    ))
+    if prev_book and cur_book and trading_active:
+        book_prev_at = prev_book[0]["captured_at"]
+        min_order_volume = alert_threshold_shares(
+            conn, symbol, ORDER_ALERT_DAILY_VOLUME_FRACTION, date_value)
+        for change in inspect_order_reductions(
+                conn, symbol, date_value, book_at, prev_book, cur_book,
+                book_prev_at, queue_shrink_reported, min_order_volume):
+            side, p = change["side"], change["price"]
+            if not alert_allowed(conn, f"{symbol}:{side}cancel:{int(p)}"):
+                continue
+            if change["disappeared"]:
+                lines = ["قیمت: " + alert_ltr(fmt_price_pct(p, price_yesterday)),
+                         "حجم قبلی سفارش: " + book_shares(change["before"]),
+                         "در دو نمونه متوالی در مظنه‌های قابل‌مشاهده نبود",
+                         "معامله بازه: " + alert_shares(change["traded"])]
+                alerts.append(format_market_alert(
+                    f"⚠️ ناپدیدشدن سفارش بزرگ {change['label']} از مظنه‌ها",
+                    symbol, book_at, ["\n".join(lines)]))
+            else:
+                alerts.append(format_book_alert(
+                    f"⚠️ کاهش قابل‌توجه سفارش {change['label']}", symbol,
+                    book_at, price_yesterday, label="سفارش",
+                    before=change["before"], now=change["now"],
+                    before_price=p, now_price=p, traded=change["traded"]))
 
     return alerts
 # ============================================================
