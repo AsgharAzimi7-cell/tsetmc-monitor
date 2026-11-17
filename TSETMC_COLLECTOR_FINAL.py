@@ -88,9 +88,19 @@ Revision 2026-11-15.2-alert-validation:
   - Reject low-value volume-only alerts unless a complete previous 20-session
     baseline and at least 1% of current daily volume support them; recheck after
     subtracting already-reported client-flow intervals.
+
+Revision 2026-11-17.1-selective-alerts:
+  - No routine preopening alerts; only exceptionally large or rapidly changing
+    displayed orders, with complete previous-20-session volume context.
+    Preopening order imbalance is NOT executed-buyer power.
+  - Suppress price-only opening, upward jump/momentum, green-crossing and
+    positive-strengthening alerts; preserve genuine flow and queue alerts.
+  - Space and decorate channel messages with clear sections and separators.
+  - Remove startup/test notifications from Telegram; log locally instead.
 """
 
 import csv
+import html
 import hashlib
 import json
 import math
@@ -121,7 +131,7 @@ COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
 EXPORT_HISTORY_SHEETS = os.getenv("TSETMC_EXPORT_HISTORY", "0") == "1"
-COLLECTOR_VERSION = "2026-11-15.2-alert-validation"
+COLLECTOR_VERSION = "2026-11-17.1-selective-alerts"
 PHASE_MIN_VOLUME_FRACTION = 0.01
 PHASE_MIN_VALUE_TOMAN = 50_000_000
 
@@ -177,6 +187,15 @@ ORDER_REDUCTION_MIN_SHARES = max(1, int(os.getenv("ORDER_REDUCTION_MIN_SHARES", 
 ORDER_REDUCTION_MIN_PCT = max(1.0, float(os.getenv("ORDER_REDUCTION_MIN_PCT", "5.0")))
 ORDER_REDUCTION_MAX_BOOK_GAP_SEC = max(15, int(os.getenv("ORDER_REDUCTION_MAX_BOOK_GAP_SEC", "120")))
 ORDER_REDUCTION_CONFIRM_MAX_SEC = max(30, int(os.getenv("ORDER_REDUCTION_CONFIRM_MAX_SEC", "180")))
+# Preopening uses *displayed orders* only: no ClientType trading power is inferred.
+# Conservative defaults; unusual book changes must be large in BOTH shares and value.
+PREOPEN_MIN_SHARES = max(1, int(os.getenv("PREOPEN_MIN_SHARES", "1000000")))
+PREOPEN_MIN_VALUE_TOMAN = max(1, int(os.getenv("PREOPEN_MIN_VALUE_TOMAN", "500000000")))
+PREOPEN_MIN_AVG20_FRACTION = max(0.01, float(os.getenv("PREOPEN_MIN_AVG20_FRACTION", "0.10")))
+PREOPEN_CHANGE_AVG20_FRACTION = max(0.005, float(os.getenv("PREOPEN_CHANGE_AVG20_FRACTION", "0.05")))
+PREOPEN_CHANGE_PCT = max(10.0, float(os.getenv("PREOPEN_CHANGE_PCT", "40.0")))
+PREOPEN_IMBALANCE_RATIO = max(2.0, float(os.getenv("PREOPEN_IMBALANCE_RATIO", "5.0")))
+PREOPEN_ALERT_COOLDOWN_SECONDS = max(60, int(os.getenv("PREOPEN_ALERT_COOLDOWN_SECONDS", "600")))
 
 CLIENT_FIELDS = {
     "real_buy_volume": ("buy_I_Volume",),
@@ -1347,15 +1366,55 @@ def format_estimated_side_average(side, volume, new_people, price, group="حقی
     return line
 
 
+def _decorate_alert_line(line):
+    """HTML-safe, understated Telegram emphasis; preserve every source number."""
+    raw = str(line).strip()
+    if not raw:
+        return ""
+    prefixes = (
+        ("قیمت", "💰"), ("آخرین", "💰"), ("پایانی", "💰"),
+        ("حجم", "📦"), ("ارزش", "💵"), ("میانگین ارزش", "💵"),
+        ("معامله بازه", "📦"), ("زمان دریافت", "⏱️"),
+        ("خرید", "🟢"), ("فروش", "🔴"),
+        ("خالص ورود", "🟢"), ("خالص خروج", "🔴"),
+        ("خالص خرید", "🟢"), ("خالص فروش", "🔴"),
+        ("قدرت", "⚡"), ("سرانه", "👥"),
+        ("نسبت", "⚖️"), ("تغییر", "🔄"),
+        ("حداقل", "🔍"), ("سهم بازه", "📊"),
+    )
+    marker = next((emoji for prefix, emoji in prefixes if raw.startswith(prefix)), "▪️")
+    left, colon, right = raw.partition(":")
+    if colon and len(left) <= 55:
+        formatted = f"<b>{html.escape(left)}:</b>{html.escape(right)}"
+    else:
+        formatted = html.escape(raw)
+    return marker + " " + formatted
+
+
 def format_market_alert(title, symbol, captured_at, sections, minutes=None):
-    time_line = "🕒 " + alert_ltr(str(captured_at).split(".")[0])
+    """Decorated intraday alert; returned HTML must use Telegram HTML parse mode."""
+    clock = alert_ltr(str(captured_at).split(".")[0])
     if minutes is not None:
         if minutes < 1:
-            time_line += " · " + alert_ltr(f"{minutes*60:.0f}") + " ثانیه"
+            clock += " · " + alert_ltr(f"{minutes*60:.0f}") + " ثانیه"
         else:
-            time_line += " · " + alert_ltr(f"{minutes:.1f}") + " دقیقه"
-    header = f"{title} — {symbol_tag(symbol)}\n{time_line}"
-    return "\n\n".join([header] + [s.strip() for s in sections if s and s.strip()])
+            clock += " · " + alert_ltr(f"{minutes:.1f}") + " دقیقه"
+    heading = f"<b>{html.escape(title)} — {html.escape(symbol_tag(symbol))}</b>\n🕒 {clock}"
+    usable = [str(section).strip() for section in sections if section and str(section).strip()]
+    if not usable:
+        return heading
+    # The detailed report may contain seven subparagraphs; a queue alert has just one.
+    # Preserve all values, but don't drown the reader in seven separate dividers.
+    first_group = usable[:2] if len(usable) > 2 else usable
+    second_group = usable[2:] if len(usable) > 2 else []
+    def group_text(items):
+        return "\n\n".join("\n".join(_decorate_alert_line(line)
+                            for line in block.splitlines() if line.strip()) for block in items)
+    blocks = [heading, "━━━━━━━━━━━━━━\n📊 <b>اطلاعات مهم تابلو</b>\n\n" + group_text(first_group)]
+    if second_group:
+        blocks.append("━━━━━━━━━━━━━━\n🔍 <b>جزئیات و جریان معاملات</b>\n\n" + group_text(second_group))
+    blocks.append("━━━━━━━━━━━━━━\n📡 <b>نبض تابلو | هشدار بورس</b>\n@NabzTablo")
+    return "\n\n".join(blocks)
 
 
 def format_trade_window_alert(conn, live, reference, captured_at, title, extra="", flow_reference=None,
@@ -1876,7 +1935,7 @@ def acknowledge_market_alert(conn, message, target):
 
 def deliver_market_alert(conn, message):
     if not isinstance(message, MarketAlert):
-        return telegram_broadcast_message(message)
+        return telegram_broadcast_message(message, parse_mode="HTML")
     sent = False
     r = message.report
     for target in market_targets():
@@ -1887,7 +1946,7 @@ def deliver_market_alert(conn, message):
                      (target, message.report_id, r["symbol"], r["date"], str(message),
                       json.dumps(r, ensure_ascii=False), time.time()))
         conn.commit()
-        if telegram_send_message(str(message), chat_id=target):
+        if telegram_send_message(str(message), chat_id=target, parse_mode="HTML"):
             acknowledge_market_alert(conn, message, target)
             sent = True
     return sent
@@ -1903,7 +1962,7 @@ def retry_market_outbox(conn):
     for row in rows:
         if row["target"] not in targets:
             continue
-        if not telegram_send_message(row["text"], chat_id=row["target"]):
+        if not telegram_send_message(row["text"], chat_id=row["target"], parse_mode="HTML"):
             break
         acknowledge_market_alert(conn, MarketAlert(row["text"], json.loads(row["payload"])), row["target"])
 
@@ -2019,6 +2078,80 @@ def inspect_order_reductions(conn, symbol, day, book_at, prior_book, current_boo
     return results
 
 
+def _preopen_order_stats(book, side):
+    """Visible orders, not completed trades or buyer/seller identities."""
+    price_key, volume_key = (("pMeDem", "qTitMeDem") if side == "buy"
+                             else ("pMeOf", "qTitMeOf"))
+    rows = [(to_float(row.get(price_key), 0), to_float(row.get(volume_key), 0))
+            for row in (book or []) if isinstance(row, dict)]
+    rows = [(price, volume) for price, volume in rows if price > 0 and volume > 0]
+    shares = sum(volume for _, volume in rows)
+    value_toman = sum(price * volume / 10.0 for price, volume in rows)
+    price = (max((p for p, _ in rows), default=0) if side == "buy"
+             else min((p for p, _ in rows), default=0))
+    return dict(shares=shares, value_toman=value_toman, price=price)
+
+
+def exceptional_preopen_alert(conn, symbol, day, clock, book, previous_book):
+    """One selective preopen signal; never label orders as actual buyer power.
+
+    A signal needs 20 prior *trading* sessions, a large visible order value,
+    and either newly dominant demand/supply or a material 40% book-side change.
+    No alert is generated for an unchanged ordinary preopen book.
+    """
+    if not is_preopen(clock) or not book:
+        return None
+    average, sessions = previous_volume_average(conn, symbol, day, sessions=20)
+    if sessions < 20 or not average or average <= 0:
+        return None
+    minimum_total = max(PREOPEN_MIN_SHARES, average * PREOPEN_MIN_AVG20_FRACTION)
+    minimum_delta = max(PREOPEN_MIN_SHARES, average * PREOPEN_CHANGE_AVG20_FRACTION)
+    now = {side: _preopen_order_stats(book, side) for side in ("buy", "sell")}
+    before = {side: _preopen_order_stats(previous_book, side) for side in ("buy", "sell")}
+    candidates = []
+    for side in ("buy", "sell"):
+        other = "sell" if side == "buy" else "buy"
+        current = now[side]
+        prior = before[side]
+        if current["shares"] < minimum_total or current["value_toman"] < PREOPEN_MIN_VALUE_TOMAN:
+            continue
+        dominance = current["shares"] >= PREOPEN_IMBALANCE_RATIO * max(1.0, now[other]["shares"])
+        prev_dominance = prior["shares"] >= PREOPEN_IMBALANCE_RATIO * max(1.0, before[other]["shares"])
+        newly_dominant = dominance and (not previous_book or not prev_dominance)
+        delta = current["shares"] - prior["shares"]
+        delta_significant = (bool(previous_book) and abs(delta) >= minimum_delta
+                             and abs(delta) >= (PREOPEN_CHANGE_PCT/100.0) * max(1.0, prior["shares"])
+                             and abs(delta) * (current["value_toman"] / current["shares"])
+                             >= PREOPEN_MIN_VALUE_TOMAN)
+        if newly_dominant or delta_significant:
+            candidates.append((current["value_toman"], side, newly_dominant, delta))
+    if not candidates:
+        return None
+    _, side, dominance, delta = max(candidates)
+    if not alert_allowed(conn, f"{symbol}:preopen:{side}", PREOPEN_ALERT_COOLDOWN_SECONDS):
+        return None
+    current, other = now[side], now["sell" if side == "buy" else "buy"]
+    direction = "خرید" if side == "buy" else "فروش"
+    title = (("🟢 برتری غیرعادی سفارش‌های خرید" if side == "buy"
+              else "🔴 فشار غیرعادی سفارش‌های فروش") if dominance
+             else f"⚠️ تغییر سنگین حجم سفارش‌های {direction}")
+    ratio_text = (alert_ltr(f"{current['shares']/other['shares']:.1f}") + " برابر"
+                  if other["shares"] > 0 else "بدون سفارش سمت مقابل در عمق نمایشی")
+    lines = [
+        "📌 فقط سفارش‌های پیش‌گشایش؛ هنوز معامله‌ای انجام نشده است.",
+        "قیمت برتر سفارش: " + alert_ltr(f"{current['price']:,.0f}") + " ریال",
+        f"حجم سفارش‌های {direction}: " + book_shares(current["shares"]),
+        "ارزش سفارش‌های قابل‌مشاهده: " + alert_money(current["value_toman"]),
+        f"نسبت حجم سفارش‌های {direction} به سمت مقابل: " + ratio_text,
+    ]
+    if previous_book and abs(delta) >= minimum_delta:
+        lines.append("تغییر حجم سفارش‌ها نسبت به نمونه قبل: " +
+                     alert_rtl_change(book_shares(before[side]["shares"]),
+                                      book_shares(current["shares"])))
+    lines.append("قدرت خریدار حقیقی پیش از معامله قابل محاسبه نیست.")
+    return format_market_alert(title + " — پیش‌گشایش", symbol, clock, ["\n".join(lines)])
+
+
 def detect_fast_alerts(conn, live, captured_at):
     """Independent price, classified-flow and book signals with separate Fast baselines."""
     alerts = []
@@ -2130,37 +2263,17 @@ def detect_fast_alerts(conn, live, captured_at):
                            or official_volume < previous_price["volume"]
                            or market_time < previous_price["market_time"]):
         price_valid = False
-    if price_valid and not previous_price:
-        # Starting/restarting mid-session must not fabricate an opening event.
-        legacy_active = conn.execute("""SELECT 1 FROM client_intraday
-            WHERE symbol=? AND date=? AND volume>0 AND market_time>='09:00:00' LIMIT 1""",
-                                     (symbol, date_value)).fetchone()
-        opening_key = f"opening_seen:{date_value}:{symbol}"
-        witnessed_open = ((prev is not None and prev["volume"] <= 0) or
-                          (prev is None and not legacy_active and 90000 <= market_time <= 90200))
-        if witnessed_open and not meta_get(conn, opening_key):
-            opening = to_float(current.get("priceFirst"), 0) or last_price
-            opening_pct = pct_change(opening, price_yesterday)
-            direction = "مثبت" if opening_pct > 0 else "منفی" if opening_pct < 0 else "بدون تغییر"
-            lines = ["قیمت گشایش: " + alert_ltr(fmt_price_pct(opening, price_yesterday))]
-            if last_price != opening:
-                lines.append("آخرین: " + alert_ltr(fmt_price_pct(last_price, price_yesterday)))
-            alerts.append(format_market_alert(f"{pct_emoji(opening_pct)} گشایش {direction}",
-                                             symbol, price_at, ["\n".join(lines)]))
-        meta_set(conn, opening_key, "1")
-    elif price_valid and previous_price:
+    if price_valid and previous_price:
         fresh_ref = fresh_price_reference(conn, symbol, date_value, previous_price, observation)
         previous_last = fresh_ref["last_price"]
         last_pct = pct_change(last_price, price_yesterday)
         previous_pct = pct_change(previous_last, price_yesterday)
         move = pct_change(last_price, previous_last)
         volume_ok = change is None or change["classified_volume"] == 0 or change["classified_volume"] >= max(50_000, threshold*.35)
-        if abs(move) >= SUDDEN_PRICE_PCT_30S and volume_ok:
-            up = move > 0
-            key = "priceup" if up else "pricedown"
-            if alert_allowed(conn, f"{symbol}:{key}"):
-                price_candidates.append(dict(title="🚀 جهش رو به بالا" if up else "🔻 ریزش ناگهانی",
-                                             reference=fresh_ref, direction=up, priority=2))
+        if move <= -SUDDEN_PRICE_PCT_30S and volume_ok:
+            if alert_allowed(conn, f"{symbol}:pricedown"):
+                price_candidates.append(dict(title="🔻 ریزش ناگهانی",
+                                             reference=fresh_ref, direction=False, priority=2))
         price_ref = momentum_reference_snapshot(conn, symbol, date_value, price_at, kind="price")
         if price_ref:
             price_ref = fresh_price_reference(conn, symbol, date_value, price_ref, observation)
@@ -2171,26 +2284,15 @@ def detect_fast_alerts(conn, live, captured_at):
             ref_pct = pct_change(price_ref["last_price"], price_yesterday)
             momentum_threshold = alert_threshold_shares(conn, symbol, MOMENTUM_DAILY_VOLUME_FRACTION, date_value)
             volume_ok = volume is None or volume == 0 or volume >= momentum_threshold
-            if abs(movement) >= MOMENTUM_PRICE_PCT and volume_ok:
-                up = movement > 0
-                key = "momentumup" if up else "momentumdown"
-                if alert_allowed(conn, f"{symbol}:{key}", MOMENTUM_ALERT_COOLDOWN_SECONDS):
-                    title = ("🟢 تقویت مثبت / خرید رو به بالا" if ref_pct > 0 and last_pct > 0
-                             else "📈 خرید رو به بالا / مومنتوم مثبت") if up else "📉 فروش رو به پایین / مومنتوم منفی"
-                    price_candidates.append(dict(title=title, reference=price_ref, direction=up, priority=1))
-            strengthen_threshold = alert_threshold_shares(conn, symbol, POSITIVE_STRENGTHEN_VOLUME_FRACTION, date_value)
-            if (ref_pct > 0 and last_pct > 0 and last_pct-ref_pct >= POSITIVE_STRENGTHEN_PCT
-                    and movement < MOMENTUM_PRICE_PCT
-                    and (volume is None or volume == 0 or volume >= strengthen_threshold)
-                    and alert_allowed(conn, f"{symbol}:positive_strengthen", POSITIVE_STRENGTHEN_COOLDOWN_SECONDS)):
-                price_candidates.append(dict(title="🟢 تقویت مثبت", reference=price_ref, direction=True, priority=1))
-        if phase_volume_allowed(conn, symbol, date_value, fresh_ref, sample, last_price):
-            if previous_pct <= 0 < last_pct and last_pct-previous_pct >= .40:
-                if alert_allowed(conn, f"{symbol}:turnedgreen"):
-                    price_candidates.append(dict(title="🟢 تغییر فاز به مثبت", reference=fresh_ref, direction=True, priority=3))
-            elif previous_pct >= 0 > last_pct and previous_pct-last_pct >= .40:
-                if alert_allowed(conn, f"{symbol}:turnedred"):
-                    price_candidates.append(dict(title="🔴 تغییر فاز به منفی", reference=fresh_ref, direction=False, priority=3))
+            if movement <= -MOMENTUM_PRICE_PCT and volume_ok:
+                if alert_allowed(conn, f"{symbol}:momentumdown", MOMENTUM_ALERT_COOLDOWN_SECONDS):
+                    price_candidates.append(dict(title="📉 فروش رو به پایین / مومنتوم منفی",
+                                                 reference=price_ref, direction=False, priority=1))
+        if (previous_pct >= 0 > last_pct and previous_pct-last_pct >= .40
+                and phase_volume_allowed(conn, symbol, date_value, fresh_ref, sample, last_price)):
+            if alert_allowed(conn, f"{symbol}:turnedred"):
+                price_candidates.append(dict(title="🔴 تغییر فاز به منفی",
+                                             reference=fresh_ref, direction=False, priority=3))
 
     alerts.extend(compose_market_reports(conn, live, flow_candidates, price_candidates, observation, sample))
     observation = dict(captured_at=price_at, volume=official_volume,
@@ -2204,6 +2306,13 @@ def detect_fast_alerts(conn, live, captured_at):
     queue_shrink_reported = set()
     prev_book_for_state = previous_book_snapshot(conn, symbol, date_value, book_at)
     cur_book_for_state = live.get("best") or []
+    if is_preopen(book_at):
+        # Quiet before 09:00 unless independently verified, exceptional order-book activity.
+        preopen_message = exceptional_preopen_alert(
+            conn, symbol, date_value, book_at, cur_book_for_state, prev_book_for_state)
+        if preopen_message:
+            alerts.append(preopen_message)
+        return alerts
     if prev_book_for_state and cur_book_for_state:
         prev_state, prev_depth, prev_q_price = book_state(prev_book_for_state)
         cur_state, cur_depth, cur_q_price = book_state(cur_book_for_state)
@@ -4157,15 +4266,18 @@ def telegram_session():
     return s
 
 
-def telegram_send_message(text, chat_id=None):
+def telegram_send_message(text, chat_id=None, parse_mode=None):
     target = str(chat_id or TELEGRAM_CHAT_ID).strip()
     if not TELEGRAM_BOT_TOKEN or not target:
         return False
     try:
         s = telegram_session()
+        payload = {"chat_id": target, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         r = s.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": target, "text": text},
+            data=payload,
             timeout=30,
         )
         r.raise_for_status()
@@ -4195,7 +4307,7 @@ def telegram_send_document(path, caption="", chat_id=None):
         return False
 
 
-def telegram_broadcast_message(text):
+def telegram_broadcast_message(text, parse_mode=None):
     """Send intraday market alerts to the private chat and configured channel."""
     targets = []
     for target in (TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID):
@@ -4204,7 +4316,7 @@ def telegram_broadcast_message(text):
             targets.append(target)
     ok = False
     for target in targets:
-        ok = telegram_send_message(text, chat_id=target) or ok
+        ok = telegram_send_message(text, chat_id=target, parse_mode=parse_mode) or ok
     return ok
 
 
@@ -4582,13 +4694,23 @@ def build_channel_eod_messages(conn, live_data, report_complete=True):
             print(f"EOD commentary unavailable for {symbol_tag(symbol)}: {exc}")
             sections.append(f"▪️ {symbol_tag(symbol)}: داده کافی برای جمع‌بندی موجود نیست.")
     # One complete, independently forwardable message per symbol, in SYMBOLS order.
-    messages = [sections[0]]
+    messages = [html.escape(sections[0])]
     date_line = "📅 " + alert_ltr(jalali_date(now))
     for section in sections[1:]:
         first, sep, rest = section.partition("\n")
-        message = first + "\n" + date_line + ("\n" + rest if sep else "")
-        message += "\n\nقیمت‌ها ریال؛ ارزش‌ها برآورد با قیمت آخر.\n📡 نبض تابلو | هشدار بورس"
-        messages.append(message)
+        detail_lines = rest.splitlines() if sep else []
+        price_lines = [line for line in detail_lines if line.startswith(("آخرین:", "پایانی:", "حجم کل:"))]
+        other_lines = [line for line in detail_lines if line not in price_lines]
+        blocks = [f"<b>{html.escape(first)}</b>\n{date_line}"]
+        if price_lines:
+            blocks.append("━━━━━━━━━━━━━━\n📊 <b>قیمت و حجم معاملات</b>\n\n" +
+                          "\n".join(_decorate_alert_line(line) for line in price_lines))
+        if other_lines:
+            blocks.append("━━━━━━━━━━━━━━\n🔍 <b>قدرت خریدار، جریان پول و نکات مهم</b>\n\n" +
+                          "\n".join(_decorate_alert_line(line) for line in other_lines))
+        blocks.append("━━━━━━━━━━━━━━\n📌 قیمت‌ها ریال؛ ارزش‌ها برآورد با قیمت آخر.\n"
+                      "📡 <b>نبض تابلو | هشدار بورس</b>\n@NabzTablo")
+        messages.append("\n\n".join(blocks))
     return messages
 
 
@@ -4620,7 +4742,7 @@ def deliver_end_of_day_reports(conn, live_data, report_path=None, report_complet
     if channel_id:
         try:
             messages = build_channel_eod_messages(conn, live_data, report_complete=report_complete)
-            outcomes = [telegram_send_message(part, chat_id=channel_id)
+            outcomes = [telegram_send_message(part, chat_id=channel_id, parse_mode="HTML")
                         for message in messages for part in split_telegram_text(message)]
             result["channel_analysis"] = bool(outcomes) and all(outcomes)
         except Exception as exc:
@@ -4861,11 +4983,9 @@ def collector_main():
 
         old, offset = telegram_get_updates(None)
         print(f"Telegram ready; ignored {len(old)} old update(s).")
-        telegram_send_message("✅ Collector آماده است؛ Fast و سفارش‌ها هر ۳۰ ثانیه، Heavy هر ۵ دقیقه، هشدار خرید/فروش درشت، جهش قیمت، صف و حذف سفارش فعال است.")
-
-        now = tehran_now()
-        if hhmmss(now) < MARKET_START_HHMMSS:
-            telegram_send_message("TSETMC collector روشن شد و منتظر شروع بازار است.")
+        # Startup notifications are operational/test messages, not market alerts.
+        # Keep them in workflow logs, never in private chat or channel.
+        print("Collector initialized; silent until actionable market signals.")
 
         while True:
             now = tehran_now()
