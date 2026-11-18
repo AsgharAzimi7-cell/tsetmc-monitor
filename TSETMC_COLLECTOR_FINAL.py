@@ -97,6 +97,16 @@ Revision 2026-11-17.1-selective-alerts:
     positive-strengthening alerts; preserve genuine flow and queue alerts.
   - Space and decorate channel messages with clear sections and separators.
   - Remove startup/test notifications from Telegram; log locally instead.
+
+Revision 2026-11-18.1-confirmed-bearish-flow:
+  - A bearish price headline now requires a new official trade (monotonic volume
+    and newer market trade time), time-aligned ClientType flow, a meaningful
+    interval volume and cash value, weak interval buyer power, and material
+    net retail selling. Missing evidence suppresses the price-only headline.
+  - The same checks apply to sudden falls, downward momentum, and red crossing.
+    Independent queue / large buyer-seller alerts are unchanged.
+  - Include verified interval evidence in a bearish price alert even when its
+    ClientType interval was already reported in a separate alert.
 """
 
 import csv
@@ -131,9 +141,20 @@ COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "0") == "1"
 SNAPSHOT_SECONDS = max(15, int(os.getenv("SNAPSHOT_SECONDS", "30")))
 HEAVY_REFRESH_SECONDS = max(60, int(os.getenv("HEAVY_REFRESH_SECONDS", "300")))
 EXPORT_HISTORY_SHEETS = os.getenv("TSETMC_EXPORT_HISTORY", "0") == "1"
-COLLECTOR_VERSION = "2026-11-17.1-selective-alerts"
+COLLECTOR_VERSION = "2026-11-18.1-confirmed-bearish-flow"
 PHASE_MIN_VOLUME_FRACTION = 0.01
 PHASE_MIN_VALUE_TOMAN = 50_000_000
+
+# Require actual, material SELL pressure before sending a bearish price headline.
+# Interval BP uses new buyer/seller *count deltas*, so it is only an estimate;
+# if it cannot be estimated, do not assert that a price fall is seller-driven.
+BEARISH_MIN_VOLUME_AVG20_FRACTION = max(0.001, float(os.getenv("BEARISH_MIN_VOLUME_AVG20_FRACTION", "0.01")))
+BEARISH_MIN_VOLUME_DAY_FRACTION = max(0.001, float(os.getenv("BEARISH_MIN_VOLUME_DAY_FRACTION", "0.01")))
+BEARISH_MIN_INTERVAL_SHARES = max(1, int(os.getenv("BEARISH_MIN_INTERVAL_SHARES", "50000")))
+BEARISH_MIN_INTERVAL_TOMAN = max(1.0, float(os.getenv("BEARISH_MIN_INTERVAL_TOMAN", "50000000")))
+BEARISH_MAX_INTERVAL_BP = min(1.0, max(0.01, float(os.getenv("BEARISH_MAX_INTERVAL_BP", "0.95"))))
+BEARISH_MIN_REAL_OUTFLOW_FRACTION = max(0.001, float(os.getenv("BEARISH_MIN_REAL_OUTFLOW_FRACTION", "0.05")))
+BEARISH_CLIENT_MAX_LAG_SECONDS = max(5, int(os.getenv("BEARISH_CLIENT_MAX_LAG_SECONDS", "45")))
 
 # Fast alerts: intentionally conservative to avoid Telegram spam.
 ALERT_COOLDOWN_SECONDS = max(30, int(os.getenv("ALERT_COOLDOWN_SECONDS", "180")))
@@ -1812,6 +1833,88 @@ def client_reference_for_price(conn, symbol, day, reference, sample):
     return row if client_interval(sample, row) is not None else None
 
 
+def validated_bearish_price_move(conn, symbol, day, reference, observation,
+                                 sample, current_price):
+    """Validate that a falling trade price coincides with material sell flow.
+
+    Receipt times are NOT transaction timestamps. We need two independently
+    increasing sources: official volume / trade time and ClientType counters.
+    Neither a price update by itself nor today's cumulative BP proves a sale.
+    A missing or stale source is a reason not to send a bearish PRICE headline.
+    """
+    if not reference or not sample or not current_price or current_price <= 0:
+        return None
+    before_at = _hms_to_seconds(reference.get("captured_at"))
+    after_at = _hms_to_seconds(observation.get("captured_at"))
+    sample_at = _hms_to_seconds(sample.get("captured_at"))
+    if any(t is None for t in (before_at, after_at, sample_at)) or after_at <= before_at:
+        return None
+    # ClientType was fetched immediately after the current price; missing or
+    # substantially delayed receipts cannot corroborate the same price move.
+    if not 0 <= sample_at - after_at <= BEARISH_CLIENT_MAX_LAG_SECONDS:
+        return None
+    old_market_time = to_int(reference.get("market_time"), 0)
+    new_market_time = to_int(observation.get("market_time"), 0)
+    old_official = to_float(reference.get("volume"), float("nan"))
+    new_official = to_float(observation.get("volume"), float("nan"))
+    if not (old_market_time > 0 and new_market_time > old_market_time
+            and math.isfinite(old_official) and math.isfinite(new_official)
+            and new_official > old_official >= 0):
+        return None
+    official_traded = new_official - old_official
+
+    # ClientType is cumulative; compare snapshots from the SAME interval, not
+    # a daily count to a 30-second price move.  Do not substitute zeros.
+    client_ref = client_reference_for_price(conn, symbol, day, reference, sample)
+    if not client_ref:
+        return None
+    client_ref_at = _hms_to_seconds(client_ref.get("captured_at"))
+    if (client_ref_at is None or client_ref_at < before_at
+            or client_ref_at - before_at > BEARISH_CLIENT_MAX_LAG_SECONDS):
+        return None
+    delta = client_interval(sample, client_ref)
+    if not delta or delta["classified_volume"] <= 0:
+        return None
+
+    # A complete previous-20-session volume history prevents missing-data
+    # baselines from classifying tiny transactions as exceptional.
+    avg20, sessions = previous_volume_average(conn, symbol, day, sessions=20)
+    if sessions < 20 or not avg20 or avg20 <= 0:
+        return None
+    min_shares = max(BEARISH_MIN_INTERVAL_SHARES,
+                     avg20 * BEARISH_MIN_VOLUME_AVG20_FRACTION,
+                     new_official * BEARISH_MIN_VOLUME_DAY_FRACTION)
+    classified = delta["classified_volume"]
+    if (classified < min_shares or official_traded < min_shares
+            or estimate_trade_value_toman(classified, current_price) < BEARISH_MIN_INTERVAL_TOMAN):
+        return None
+    # A ClientType update arriving after the official price read must not
+    # describe a much larger, later window than the price comparison.
+    if classified > max(official_traded * 1.5, official_traded + 50_000):
+        return None
+
+    interval_bp = real_buyer_power(delta["real_buy_volume"], delta["real_sell_volume"],
+                                   delta["real_buy_count"], delta["real_sell_count"])
+    if interval_bp is None or interval_bp >= BEARISH_MAX_INTERVAL_BP:
+        return None
+    net_real = delta["real_buy_volume"] - delta["real_sell_volume"]
+    if net_real >= -classified * BEARISH_MIN_REAL_OUTFLOW_FRACTION:
+        return None
+    return dict(official_traded=official_traded, classified_traded=classified,
+                interval_bp=interval_bp, real_net_volume=net_real,
+                reference_at=reference["captured_at"], last_at=observation["captured_at"])
+
+
+def format_verified_bearish_evidence(evidence):
+    """Compact proof of trading/interval sell pressure for a price alert."""
+    if not evidence:
+        return ""
+    return ("معامله جدید تأییدشده: " + alert_shares(evidence["official_traded"])
+            + "\nحجم حقیقی/حقوقی بازه: " + alert_shares(evidence["classified_traded"])
+            + "\nقدرت خریدار بازه (تخمینی): " + alert_ltr(f'{evidence["interval_bp"]:.2f}')
+            + "\nخالص فروش حقیقی بازه: " + alert_shares(abs(evidence["real_net_volume"])))
+
+
 def phase_volume_allowed(conn, symbol, day, reference, sample, price):
     client_ref = client_reference_for_price(conn, symbol, day, reference, sample)
     change = client_interval(sample, client_ref)
@@ -1908,6 +2011,7 @@ def compose_market_reports(conn, live, flow_candidates, price_candidates, observ
             combined["reference"] = ref
         combined["report"]["price"] = [ref, observation]
         combined["price_signal"] = True
+        combined["bearish_evidence"] = selected.get("bearish_evidence")
         for item in choices:
             if item is not selected:
                 combined["extras"].append(item["title"])
@@ -1915,8 +2019,19 @@ def compose_market_reports(conn, live, flow_candidates, price_candidates, observ
     messages = []
     for item in prepared:
         extras = list(dict.fromkeys(s.split(" ", 1)[-1] for s in item["extras"]))
+        verified = item.get("bearish_evidence")
+        flow_shown = sum_flow_segments(item["segments"]) if item["segments"] else None
+        if verified and flow_shown and flow_shown["classified_volume"] == verified["classified_traded"]:
+            # The standard flow section already prints interval volume/BP/net:
+            # show only the independent official trade-volume confirmation.
+            evidence = "حجم معامله جدید در آمار رسمی: " + alert_shares(verified["official_traded"])
+        else:
+            # ClientType may have been reported earlier; keep the price alert
+            # self-explanatory even with no unreported flow segments remaining.
+            evidence = format_verified_bearish_evidence(verified)
+        extra = "\n".join(x for x in (evidence, " · ".join(extras)) if x)
         text = format_trade_window_alert(conn, live, item["reference"], observation["captured_at"],
-                    item["title"], extra=" · ".join(extras), flow_segments=item["segments"], residual=item["residual"],
+                    item["title"], extra=extra, flow_segments=item["segments"], residual=item["residual"],
                     duration_override=(sum(_hms_to_seconds(b["captured_at"])-_hms_to_seconds(a["captured_at"])
                                            for a,b in item["segments"])/60
                                        if item["segments"] and not item.get("price_signal") else None))
@@ -2269,30 +2384,33 @@ def detect_fast_alerts(conn, live, captured_at):
         last_pct = pct_change(last_price, price_yesterday)
         previous_pct = pct_change(previous_last, price_yesterday)
         move = pct_change(last_price, previous_last)
-        volume_ok = change is None or change["classified_volume"] == 0 or change["classified_volume"] >= max(50_000, threshold*.35)
-        if move <= -SUDDEN_PRICE_PCT_30S and volume_ok:
-            if alert_allowed(conn, f"{symbol}:pricedown"):
-                price_candidates.append(dict(title="🔻 ریزش ناگهانی",
-                                             reference=fresh_ref, direction=False, priority=2))
+        sudden_evidence = (validated_bearish_price_move(conn, symbol, date_value,
+                           fresh_ref, observation, sample, last_price)
+                           if move is not None and move <= -SUDDEN_PRICE_PCT_30S else None)
+        if sudden_evidence and alert_allowed(conn, f"{symbol}:pricedown"):
+            price_candidates.append(dict(title="🔻 ریزش ناگهانی",
+                                         reference=fresh_ref, direction=False, priority=2,
+                                         bearish_evidence=sudden_evidence))
         price_ref = momentum_reference_snapshot(conn, symbol, date_value, price_at, kind="price")
         if price_ref:
             price_ref = fresh_price_reference(conn, symbol, date_value, price_ref, observation)
-            client_ref = client_reference_for_price(conn, symbol, date_value, price_ref, sample)
-            momentum_change = client_interval(sample, client_ref)
-            volume = momentum_change["classified_volume"] if momentum_change else None
             movement = pct_change(last_price, price_ref["last_price"])
-            ref_pct = pct_change(price_ref["last_price"], price_yesterday)
-            momentum_threshold = alert_threshold_shares(conn, symbol, MOMENTUM_DAILY_VOLUME_FRACTION, date_value)
-            volume_ok = volume is None or volume == 0 or volume >= momentum_threshold
-            if movement <= -MOMENTUM_PRICE_PCT and volume_ok:
-                if alert_allowed(conn, f"{symbol}:momentumdown", MOMENTUM_ALERT_COOLDOWN_SECONDS):
-                    price_candidates.append(dict(title="📉 فروش رو به پایین / مومنتوم منفی",
-                                                 reference=price_ref, direction=False, priority=1))
-        if (previous_pct >= 0 > last_pct and previous_pct-last_pct >= .40
-                and phase_volume_allowed(conn, symbol, date_value, fresh_ref, sample, last_price)):
-            if alert_allowed(conn, f"{symbol}:turnedred"):
+            momentum_evidence = (validated_bearish_price_move(conn, symbol, date_value,
+                                 price_ref, observation, sample, last_price)
+                                 if movement is not None and movement <= -MOMENTUM_PRICE_PCT else None)
+            if momentum_evidence and alert_allowed(conn, f"{symbol}:momentumdown", MOMENTUM_ALERT_COOLDOWN_SECONDS):
+                price_candidates.append(dict(title="📉 فروش رو به پایین / مومنتوم منفی",
+                                             reference=price_ref, direction=False, priority=1,
+                                             bearish_evidence=momentum_evidence))
+        if (previous_pct is not None and last_pct is not None
+                and previous_pct >= 0 > last_pct and previous_pct-last_pct >= .40):
+            phase_evidence = validated_bearish_price_move(
+                conn, symbol, date_value, fresh_ref, observation, sample, last_price)
+            if (phase_evidence and phase_volume_allowed(conn, symbol, date_value, fresh_ref, sample, last_price)
+                    and alert_allowed(conn, f"{symbol}:turnedred")):
                 price_candidates.append(dict(title="🔴 تغییر فاز به منفی",
-                                             reference=fresh_ref, direction=False, priority=3))
+                                             reference=fresh_ref, direction=False, priority=3,
+                                             bearish_evidence=phase_evidence))
 
     alerts.extend(compose_market_reports(conn, live, flow_candidates, price_candidates, observation, sample))
     observation = dict(captured_at=price_at, volume=official_volume,
